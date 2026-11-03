@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Message</title>
+  <style>
+  :root {
+    color-scheme: dark;
+    font: 16px system-ui, sans-serif;
+    background: #111318;
+    color: #e8eaf0;
+  }
+
+  body {
+    max-width: 640px;
+    margin: 3rem auto;
+    padding: 0 1rem;
+  }
+
+  textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 8rem;
+    margin-top: 0.5rem;
+    padding: 0.7rem;
+    border: 1px solid #454957;
+    border-radius: 8px;
+    background: #1b1e26;
+    color: #e8eaf0;
+    font: inherit;
+  }
+
+  button {
+    margin-top: 0.7rem;
+    padding: 0.6rem 1rem;
+    border: 0;
+    border-radius: 8px;
+    background: #7c9cff;
+    color: #111318;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  button:hover {
+    background: #9ab1ff;
+  }
+
+  #status {
+    margin: 1rem 0;
+    color: #b7c5ff;
+  }
+
+  #result {
+    color: #aab0bf;
+  }
+
+  #gif-result {
+    color: #aab0bf;
+  }
+</style>
+</head>
+<body>
+  <h1>ESP32 Message</h1>
+  <p id="status">Checking ESP32…</p>
+  <form id="form">
+    <label for="text">Display message</label>
+    <textarea id="text" maxlength="300"></textarea>
+    <button type="submit">Publish message</button>
+  </form>
+<form id="gif-form">
+  <label for="gif-file">Upload a GIF for the OLED</label>
+  <input id="gif-file" type="file" accept="image/gif">
+  <button type="submit">Upload GIF</button>
+</form>
+<p id="gif-result"></p>
+  <p id="result"></p>
+
+  <script>
+    const statusEl = document.querySelector("#status");
+    const textEl = document.querySelector("#text");
+    const resultEl = document.querySelector("#result");
+
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/api/status");
+        const status = await response.json();
+        statusEl.textContent = status.device_seen
+          ? "ESP32: recently connected"
+          : "ESP32: not seen yet";
+        if (document.activeElement !== textEl) {
+          textEl.value = status.message.text;
+        }
+      } catch {
+        statusEl.textContent = "Cannot reach the server";
+      }
+    }
+
+    document.querySelector("#form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const response = await fetch("/api/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: textEl.value })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Request failed");
+        resultEl.textContent = "Published.";
+        await refreshStatus();
+      } catch (error) {
+        resultEl.textContent = "Could not publish: " + error.message;
+      }
+    });
+
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+
+const gifResult = document.querySelector("#gif-result");
+
+document.querySelector("#gif-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  const file = document.querySelector("#gif-file").files[0];
+  if (!file) {
+    gifResult.textContent = "Choose a GIF first.";
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("gif", file);
+
+  try {
+    gifResult.textContent = "Uploading…";
+    const response = await fetch("/api/animation", {
+      method: "POST",
+      body: formData
+    });
+    const data = await response.json();
+    if (!response.ok)
+        throw new Error(data.error || "Upload failed");
+
+    gifResult.textContent = `Uploaded ${data.frame_count} frames.`;
+  } catch (error) {
+    gifResult.textContent = "Could not upload: " + error.message;
+  }
+});
+  </script>
+</body>
+</html>
