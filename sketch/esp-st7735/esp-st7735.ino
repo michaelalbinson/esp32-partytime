@@ -32,6 +32,20 @@ Adafruit_ST7789 display(TFT_CS, TFT_DC, TFT_RST);
 // Entire downloaded frame is stored as RGB332, one byte per pixel.
 uint8_t frameBuffer[MAX_FRAME_PIXELS];
 
+// Frames are cached in RAM after their first download so playback doesn't wait
+// on the network. Each frame gets its own malloc'd slot (no big contiguous block
+// needed). Caching stops at the byte budget, or when free heap would drop below
+// the reserve kept for WiFi/HTTP/JSON; remaining frames stream via frameBuffer.
+#define MAX_CACHE_FRAMES 60
+#define CACHE_BUDGET_BYTES (90 * 1024)
+#define HEAP_RESERVE_BYTES (70 * 1024)
+uint8_t *frameCache[MAX_CACHE_FRAMES];
+size_t cacheBytes = 0;
+int cachedFrames = 0;
+// Buffer holding the frame that is ready to draw (a cache slot or frameBuffer).
+const uint8_t *readyFrame = nullptr;
+bool readyFromCache = false;
+
 // Reusable buffer for converting and drawing a strip as RGB565.
 uint16_t pixelBuffer[MAX_STRIP_PIXELS];
 
@@ -58,7 +72,7 @@ uint16_t frameDelays[MAX_ANIMATION_FRAMES];
 // The next frame is fetched right after the current one is drawn, then drawn
 // at nextFrameAt. Network latency therefore only matters if a fetch takes
 // longer than the frame's delay.
-bool frameReady = false;         // frameBuffer holds frame animationFrameIndex
+bool frameReady = false;         // readyFrame holds frame animationFrameIndex
 bool animationResync = true;     // next draw starts a fresh schedule
 unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
 unsigned long lastFrameFetch = 0;
@@ -172,6 +186,7 @@ bool checkAnimation() {
   if (newVersion != animationVersion) {
     animationVersion = newVersion;
     animationFrameIndex = 0;
+    freeFrameCache();
     restartAnimationSchedule();
 
     // Clear the previous GIF or message before the new animation starts.
@@ -265,15 +280,53 @@ void scheduleNextFrame(unsigned long now, int drawnIndex) {
   animationResync = false;
 }
 
+// Release every cached frame (the animation or its geometry changed).
+void freeFrameCache() {
+  for (int i = 0; i < MAX_CACHE_FRAMES; i++) {
+    if (frameCache[i]) {
+      free(frameCache[i]);
+      frameCache[i] = nullptr;
+    }
+  }
+  cacheBytes = 0;
+  cachedFrames = 0;
+  readyFrame = nullptr;
+}
+
+// Try to reserve a cache slot for a frame; returns nullptr if over budget or
+// if it would eat into the heap reserve.
+uint8_t *allocCacheSlot(int index, size_t size) {
+  if (index < 0 || index >= MAX_CACHE_FRAMES) return nullptr;
+  if (cacheBytes + size > CACHE_BUDGET_BYTES) return nullptr;
+  if (ESP.getFreeHeap() < size + HEAP_RESERVE_BYTES) return nullptr;
+
+  uint8_t *slot = (uint8_t *)malloc(size);
+  if (!slot) return nullptr;
+
+  frameCache[index] = slot;
+  cacheBytes += size;
+  cachedFrames++;
+  return slot;
+}
+
+void releaseCacheSlot(int index, size_t size) {
+  if (index < 0 || index >= MAX_CACHE_FRAMES || !frameCache[index]) return;
+  free(frameCache[index]);
+  frameCache[index] = nullptr;
+  cacheBytes -= size;
+  cachedFrames--;
+}
+
 // Throw away any prefetched frame and start the schedule over.
 void restartAnimationSchedule() {
   frameReady = false;
+  readyFrame = nullptr;
   animationResync = true;
   nextFrameAt = millis();
 }
 
-// Download a frame into frameBuffer without drawing it.
-bool fetchFrame(int frameIndex) {
+// Download a frame into dest (pixelCount bytes) without drawing it.
+bool fetchFrame(int frameIndex, uint8_t *dest) {
   if (WiFi.status() != WL_CONNECTED ||
       frameWidth < 1 || frameHeight < 1) {
     return false;
@@ -322,7 +375,7 @@ bool fetchFrame(int frameIndex) {
   // Receive the whole RGB332 frame before drawing any part of it.
   WiFiClient *stream = http.getStreamPtr();
 
-  if (!readExact(stream, frameBuffer, pixelCount)) {
+  if (!readExact(stream, dest, pixelCount)) {
     Serial.printf("Frame %d: failed reading full frame\n", frameIndex);
     http.end();
     return false;
@@ -332,8 +385,8 @@ bool fetchFrame(int frameIndex) {
   return true;
 }
 
-// Convert the buffered frame and draw it in RGB565 strips.
-bool drawFrame() {
+// Convert a frame and draw it in RGB565 strips.
+bool drawFrame(const uint8_t *src) {
   for (int row = 0; row < frameHeight; row += STRIP_ROWS) {
     int rows = STRIP_ROWS;
 
@@ -351,7 +404,7 @@ bool drawFrame() {
     size_t sourceOffset = (size_t)row * (size_t)frameWidth;
 
     for (size_t i = 0; i < stripPixels; i++) {
-      uint8_t c = frameBuffer[sourceOffset + i];
+      uint8_t c = src[sourceOffset + i];
 
       uint8_t r3 = (c >> 5) & 0x07;
       uint8_t g3 = (c >> 2) & 0x07;
@@ -474,7 +527,27 @@ void loop() {
     if (!frameReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
       lastFrameFetch = now;
       unsigned long fetchStart = millis();
-      frameReady = fetchFrame(animationFrameIndex);
+      size_t pixelCount = (size_t)frameWidth * (size_t)frameHeight;
+
+      if (animationFrameIndex < MAX_CACHE_FRAMES && frameCache[animationFrameIndex]) {
+        // Already downloaded on an earlier pass: no network needed.
+        readyFrame = frameCache[animationFrameIndex];
+        readyFromCache = true;
+        frameReady = true;
+      } else {
+        uint8_t *slot = allocCacheSlot(animationFrameIndex, pixelCount);
+        uint8_t *dest = slot ? slot : frameBuffer;
+
+        frameReady = fetchFrame(animationFrameIndex, dest);
+
+        if (frameReady) {
+          readyFrame = dest;
+          readyFromCache = false;
+        } else if (slot) {
+          releaseCacheSlot(animationFrameIndex, pixelCount);
+        }
+      }
+
       lastFetchMs = millis() - fetchStart;
       lastFetchDoneAt = millis();
     }
@@ -487,13 +560,16 @@ void loop() {
       frameReady &&
       (long)(now - nextFrameAt) >= 0) {
     unsigned long drawStart = millis();
-    bool drawn = drawFrame();
+    bool drawn = drawFrame(readyFrame);
     unsigned long drawMs = millis() - drawStart;
 
     // frame=index  delay=GIF delay  fetch=download time  wait=time the frame
     // sat ready before its deadline (negative: drew late)  draw=SPI time.
-    Serial.printf("frame=%d delay=%lu fetch=%lu wait=%ld draw=%lu heap=%u maxblk=%u\n",
+    Serial.printf("frame=%d src=%s cached=%d/%d delay=%lu fetch=%lu wait=%ld draw=%lu heap=%u maxblk=%u\n",
                   animationFrameIndex,
+                  readyFromCache ? "cache" : "net",
+                  cachedFrames,
+                  animationFrameCount,
                   delayForFrame(animationFrameIndex),
                   lastFetchMs,
                   (long)(nextFrameAt - lastFetchDoneAt),
