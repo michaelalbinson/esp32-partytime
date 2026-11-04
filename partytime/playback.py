@@ -3,8 +3,10 @@
 import logging
 import time
 
+from .config import EFFECTS
 from .media.gif import GifError
 from .program import WAIT, Effect, ProgramError, build_animation
+from .protocol import cycle_position_ms
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,42 @@ def play_show(registry, library, show):
             for name, anim in animations.items()
         ],
     }
+
+
+EFFECT_NAMES = {code: name for name, code in EFFECTS.items()}
+EFFECT_LABELS = {"rain": "Digital rain", "static": "Static"}
+
+
+def now_playing(anim, library, shows, now=None):
+    """
+    What a device is showing right now, from its program and the show clock:
+    {"kind": "gif" | "effect" | "wait", "name": ..., "show": show name or None}.
+    None if no program is assigned. Between steps a lane idles, which reads as
+    a wait.
+    """
+    if not anim.get("steps"):
+        return None
+
+    position = cycle_position_ms(anim, now)
+    step = next(
+        (s for s in anim["steps"]
+         if s["start_ms"] <= position < s["start_ms"] + s["duration_ms"]),
+        None,
+    )
+
+    show = shows.get(anim.get("show_id")) if anim.get("show_id") else None
+    result = {"kind": "wait", "name": "Waiting (showing text)",
+              "show": show["name"] if show else None}
+
+    if step and step["clip"] >= 0:
+        gif_id = anim["clips"][step["clip"]].get("gif")
+        entry = library.get(gif_id) if gif_id else None
+        result.update(kind="gif", name=entry["name"] if entry else "GIF")
+    elif step and step["clip"] == -2:
+        effect = EFFECT_NAMES.get(step.get("effect"), "effect")
+        result.update(kind="effect", name=EFFECT_LABELS.get(effect, effect))
+
+    return result
 
 
 def playing_devices(registry, show_id):

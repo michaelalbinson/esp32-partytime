@@ -202,12 +202,20 @@
           <div class="device-info">
             Screen: ${escapeHtml(device.screen_type)} | Last seen: ${device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never'}
           </div>
+          <div class="device-info">${nowPlayingHtml(device.now_playing)}</div>
           <div class="device-actions">
             <button onclick="editDevice('${escapeHtml(device.name)}')">Edit Message</button>
             <button onclick="deleteDevice('${escapeHtml(device.name)}')" class="delete">Delete</button>
           </div>
         </div>
       `).join('');
+    }
+
+    function nowPlayingHtml(playing) {
+      if (!playing) return 'Now showing: message';
+      const icon = { gif: '', effect: '✨ ', wait: '⏸ ' }[playing.kind] || '';
+      const show = playing.show ? ` <span style="opacity:.7">(show: ${escapeHtml(playing.show)})</span>` : '';
+      return `Now playing: ${icon}${escapeHtml(playing.name)}${show}`;
     }
 
     function escapeHtml(text) {

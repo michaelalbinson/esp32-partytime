@@ -125,6 +125,7 @@ def build_animation(steps, sources):
         picked = pick_frames(len(source.frames), keep)
 
         clips.append({
+            "gif": gif_id,
             "first_frame": len(rgb332_frames),
             "frame_count": len(picked),
             "width": width,

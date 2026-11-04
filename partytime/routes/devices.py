@@ -2,6 +2,7 @@
 
 from flask import Blueprint, jsonify, request
 
+from ..playback import now_playing
 from ..registry import new_device
 from ..services import services
 
@@ -10,7 +11,8 @@ bp = Blueprint("devices", __name__)
 
 @bp.get("/api/devices")
 def list_devices():
-    registry = services().registry
+    services_ = services()
+    registry = services_.registry
 
     with registry.lock:
         return jsonify(devices=[
@@ -19,6 +21,11 @@ def list_devices():
                 "screen_type": info.get("screen_type", "unknown"),
                 "last_seen": info.get("last_seen"),
                 "online": registry.is_online(info, name),
+                "now_playing": now_playing(
+                    info.get("animation", {}),
+                    services_.library,
+                    services_.shows.shows,
+                ),
             }
             for name, info in registry.devices.items()
         ])
@@ -26,7 +33,8 @@ def list_devices():
 
 @bp.get("/api/devices/<name>")
 def get_device(name):
-    registry = services().registry
+    services_ = services()
+    registry = services_.registry
 
     with registry.lock:
         if name not in registry.devices:
@@ -42,6 +50,9 @@ def get_device(name):
             "last_seen": info.get("last_seen"),
             "online": registry.is_online(info, name),
             "message": info.get("message", {}),
+            "now_playing": now_playing(
+                anim, services_.library, services_.shows.shows
+            ),
             "animation": {
                 "version": anim.get("version", 0),
                 "frame_count": len(anim.get("frames", [])),

@@ -149,6 +149,13 @@ class ApiTests(unittest.TestCase):
         listed = self.client.get("/api/shows").get_json()["shows"][0]
         self.assertEqual(sorted(listed["playing_on"]), ["oled", "tft"])
 
+        # The device view names what's playing: the show started just now, so
+        # oled is in its GIF step and tft is still waiting.
+        devices = {d["name"]: d for d in self.client.get("/api/devices").get_json()["devices"]}
+        self.assertEqual(devices["oled"]["now_playing"],
+                         {"kind": "gif", "name": "a", "show": "Party"})
+        self.assertEqual(devices["tft"]["now_playing"]["kind"], "wait")
+
         # A new message takes a device out of the show.
         self.client.post("/api/message?device=oled", json={"text": "hi"})
         self.assertEqual(self.client.get("/api/animation?device=oled").get_json()
