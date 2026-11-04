@@ -41,6 +41,11 @@ SCREEN_HEIGHT = 320
 MONO_WIDTH = 128
 MONO_HEIGHT = 64
 
+# Many SSD1306 panels are two-colour: a yellow band across the top 16 rows and
+# blue below. The top band is reserved for the dancing message text, so the GIF
+# is fitted into the blue area underneath.
+MONO_TEXT_BAND = 16
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper()),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -165,17 +170,23 @@ def get_animation(device_id):
 def rgb_to_mono_frame(rgb):
     """
     Convert an RGB image to a 128x64, 1-bit-per-pixel frame for SSD1306
-    devices: fit with aspect ratio preserved, centered on black, dithered.
+    devices: fit below the top text band with aspect ratio preserved, centered
+    on black, dithered. The text band stays black for the device to draw on.
     Rows are packed MSB-first (what Adafruit's drawBitmap expects),
     1024 bytes in total.
     """
+    area_height = MONO_HEIGHT - MONO_TEXT_BAND
+
     fitted = rgb.copy()
-    fitted.thumbnail((MONO_WIDTH, MONO_HEIGHT), Image.Resampling.LANCZOS)
+    fitted.thumbnail((MONO_WIDTH, area_height), Image.Resampling.LANCZOS)
 
     canvas = Image.new("RGB", (MONO_WIDTH, MONO_HEIGHT), (0, 0, 0))
     canvas.paste(
         fitted,
-        ((MONO_WIDTH - fitted.width) // 2, (MONO_HEIGHT - fitted.height) // 2),
+        (
+            (MONO_WIDTH - fitted.width) // 2,
+            MONO_TEXT_BAND + (area_height - fitted.height) // 2,
+        ),
     )
 
     # convert("1") applies Floyd-Steinberg dithering; white pixels are 1 bits.

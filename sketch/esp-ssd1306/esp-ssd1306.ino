@@ -33,6 +33,20 @@ unsigned long lastAnimationCheck = 0;
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
+// Two-colour panels have a yellow band across the top 16 rows. While an
+// animation plays, the message text dances there and the GIF fills the rest
+// (the server leaves these rows black in every frame).
+#define TEXT_BAND_HEIGHT 16
+const unsigned long DANCE_INTERVAL_MS = 80;
+const int DANCE_AMPLITUDE = 4;      // pixels up/down from the band's middle
+const int SCROLL_PX_PER_TICK = 2;   // marquee speed for text wider than the screen
+const int CHAR_WIDTH = 6;           // size 1 font
+const int TEXT_GAP = 24;            // blank space between marquee repeats
+unsigned long lastDanceTick = 0;
+bool animationDrawn = false;  // a GIF frame is on screen, so the band may dance
+int dancePhase = 0;
+int scrollOffset = 0;
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 String currentText = "";
@@ -161,14 +175,61 @@ bool fetchAnimationFrame(int index) {
   return true;
 }
 
+// Draw the message into the top band, one character at a time with each
+// character bobbing on a sine wave. Text wider than the screen scrolls.
+// Only touches the band, so the GIF below is left as it is in the buffer.
+void drawDancingText() {
+  display.fillRect(0, 0, SCREEN_WIDTH, TEXT_BAND_HEIGHT, SSD1306_BLACK);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextWrap(false);
+
+  String text = currentText.length() ? currentText : "Waiting...";
+  int textWidth = text.length() * CHAR_WIDTH;
+  bool scrolling = textWidth > SCREEN_WIDTH;
+  int baseY = (TEXT_BAND_HEIGHT - 8) / 2;
+
+  // Scrolling text repeats every (textWidth + gap) pixels; short text is centered.
+  int startX = scrolling ? -scrollOffset : (SCREEN_WIDTH - textWidth) / 2;
+  int repeatWidth = textWidth + TEXT_GAP;
+
+  for (int copy = 0; copy < (scrolling ? 2 : 1); copy++) {
+    int copyX = startX + copy * repeatWidth;
+    if (copyX >= SCREEN_WIDTH || copyX + textWidth <= 0) continue;
+
+    for (int i = 0; i < (int)text.length(); i++) {
+      int x = copyX + i * CHAR_WIDTH;
+      if (x < -CHAR_WIDTH || x >= SCREEN_WIDTH) continue;
+
+      int y = baseY + (int)roundf(DANCE_AMPLITUDE * sinf((dancePhase + i * 3) * 0.2f));
+      display.drawChar(x, y, text[i], SSD1306_WHITE, SSD1306_BLACK, 1);
+    }
+  }
+
+  if (scrolling) scrollOffset = (scrollOffset + SCROLL_PX_PER_TICK) % repeatWidth;
+  dancePhase++;
+}
+
 void drawAnimationFrame(int index) {
   Serial.printf("Displaying frame %d\n", index);
   display.clearDisplay();
   display.drawBitmap(0, 0, frameBitmap, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+  drawDancingText();
   display.display();
+  lastDanceTick = millis();
+  animationDrawn = true;
+}
+
+// Keep the text moving between GIF frames (GIFs can have long delays).
+void danceTick() {
+  if (millis() - lastDanceTick < DANCE_INTERVAL_MS) return;
+  drawDancingText();
+  display.display();
+  lastDanceTick = millis();
 }
 
 void drawScreen() {
+  animationDrawn = false;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
@@ -295,6 +356,9 @@ void loop() {
       frameReady = false;
       lastFrameFetch = 0;
     }
+
+    // Only once a frame is on screen; otherwise the band would dance over stale content.
+    if (animationDrawn) danceTick();
   }
 
   delay(10);
