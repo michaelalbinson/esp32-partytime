@@ -5,29 +5,37 @@
 #include <Adafruit_SSD1306.h>
 #include <Arduino_JSON.h>
 #include <secrets.h>
+#include "timeline.h"
 
 const int OLED_SDA = 21;
 const int OLED_SCL = 22;
 const unsigned long POLL_INTERVAL_MS = 2000;
 
+// What the server told us to play (see timeline.h), and our clock against it.
+Timeline timeline;
+TlClock clock_;
 int animationVersion = -1;
-int animationFrameCount = 0;
-int animationFrameIndex = 0;
-unsigned long animationFrameMs = 120;
 
-// Per-frame display time from the GIF. Falls back to animationFrameMs.
-#define MAX_ANIMATION_FRAMES 60
-uint16_t frameDelays[MAX_ANIMATION_FRAMES];
-// The next frame is fetched right after the current one is drawn, then drawn
-// at nextFrameAt. Network latency therefore only matters if a fetch takes
-// longer than the frame's delay.
-bool frameReady = false;         // buffer holds frame animationFrameIndex
-bool animationResync = true;     // next draw starts a fresh schedule
-unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
+// Playback: "target" is what to draw next, at changeAt (device millis). Its
+// frame is fetched ahead of time, so network latency only matters if a fetch
+// takes longer than the time before the change.
+bool haveTarget = false;
+TlPos target;
+bool targetReady = false;
+unsigned long changeAt = 0;
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
 uint8_t frameBitmap[1024];
 unsigned long lastAnimationCheck = 0;
+
+// What is on screen. Message text is only drawn in text mode, so it never
+// overwrites a GIF or an effect.
+enum ScreenMode { SCREEN_TEXT, SCREEN_GIF, SCREEN_EFFECT };
+ScreenMode screenMode = SCREEN_TEXT;
+int shownFrame = -1;
+int shownEffect = TL_EFFECT_NONE;
+const unsigned long EFFECT_TICK_MS = 60;
+unsigned long lastEffectTick = 0;
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -43,7 +51,6 @@ const int SCROLL_PX_PER_TICK = 2;   // marquee speed for text wider than the scr
 const int CHAR_WIDTH = 6;           // size 1 font
 const int TEXT_GAP = 24;            // blank space between marquee repeats
 unsigned long lastDanceTick = 0;
-bool animationDrawn = false;  // a GIF frame is on screen, so the band may dance
 int dancePhase = 0;
 int scrollOffset = 0;
 
@@ -54,6 +61,7 @@ String currentVersion = "";
 bool serverOnline = false;
 unsigned long lastPoll = 0;
 
+// Ask the server what to play. Returns false if it couldn't be reached.
 bool checkAnimation() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -63,6 +71,7 @@ bool checkAnimation() {
 
   if (!http.begin(client, url)) return false;
 
+  unsigned long sentAt = millis();
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("Animation check failed: HTTP %d\n", code);
@@ -70,8 +79,11 @@ bool checkAnimation() {
     return false;
   }
 
-  JSONVar info = JSON.parse(http.getString());
+  String response = http.getString();
+  unsigned long receivedAt = millis();
   http.end();
+
+  JSONVar info = JSON.parse(response);
 
   if (JSON.typeof(info) == "undefined") {
     Serial.println("Failed to parse animation info");
@@ -79,74 +91,40 @@ bool checkAnimation() {
   }
 
   int newVersion = (int)info["version"];
-  int newFrameCount = (int)info["frame_count"];
-  int newFrameMs = (int)info["frame_ms"];
-
-  Serial.printf("Animation check: version=%d, frames=%d\n", newVersion, newFrameCount);
-
-  if (newFrameMs > 0) animationFrameMs = newFrameMs;
-  loadFrameDelays(info);
 
   if (newVersion != animationVersion) {
     animationVersion = newVersion;
-    animationFrameCount = newFrameCount;
-    animationFrameIndex = 0;
-    restartAnimationSchedule();
-    Serial.printf("Animation updated to version %d with %d frames\n", newVersion, newFrameCount);
+    haveTarget = false;
+    targetReady = false;
+    clock_.synced = false;
 
-    // Animation was cleared (e.g. a new message was sent): show the text again.
-    if (newFrameCount == 0) drawScreen();
+    if (!tlLoadJson(timeline, info)) {
+      Serial.println("Bad program, ignoring it");
+      tlClear(timeline);
+    }
+
+    Serial.printf("Animation updated to version %d: %d steps, %d frames, cycle %lu ms\n",
+                  newVersion, timeline.stepCount, timeline.frameCount,
+                  (unsigned long)timeline.cycleMs);
+
+    // Clear whatever was playing and show the message again.
+    enterTextMode();
+  }
+
+  if (tlActive(timeline)) {
+    uint32_t position = (uint32_t)(int)info["program"]["position_ms"];
+    unsigned long midpoint = sentAt + (receivedAt - sentAt) / 2;
+
+    if (tlSync(timeline, clock_, midpoint, position, false)) {
+      haveTarget = false;
+      targetReady = false;
+    }
   }
 
   return true;
 }
 
-// Read the per-frame delays the server sends from the GIF's metadata.
-void loadFrameDelays(JSONVar& info) {
-  JSONVar delays = info["frame_delays"];
-  int count = 0;
-
-  if (JSON.typeof(delays) == "array") {
-    count = delays.length();
-    if (count > MAX_ANIMATION_FRAMES) count = MAX_ANIMATION_FRAMES;
-  }
-
-  for (int i = 0; i < MAX_ANIMATION_FRAMES; i++) {
-    int ms = (i < count) ? (int)delays[i] : 0;
-    frameDelays[i] = (ms > 0 && ms < 65535) ? ms : 0;
-  }
-}
-
-unsigned long delayForFrame(int index) {
-  if (index >= 0 && index < MAX_ANIMATION_FRAMES && frameDelays[index] > 0) {
-    return frameDelays[index];
-  }
-  return animationFrameMs;
-}
-
-// Set the deadline for the frame after the one drawn at "now". The deadline
-// advances by exactly the frame's delay so timing doesn't drift; if we have
-// fallen a whole frame behind (slow network), restart the schedule instead.
-void scheduleNextFrame(unsigned long now, int drawnIndex) {
-  unsigned long d = delayForFrame(drawnIndex);
-
-  if (animationResync || (long)(now - nextFrameAt) >= (long)d) {
-    nextFrameAt = now + d;
-  } else {
-    nextFrameAt += d;
-  }
-
-  animationResync = false;
-}
-
-// Throw away any prefetched frame and start the schedule over.
-void restartAnimationSchedule() {
-  frameReady = false;
-  animationResync = true;
-  nextFrameAt = millis();
-}
-
-// Download a frame into frameBitmap without drawing it.
+// Download frame number index of the lane into frameBitmap without drawing it.
 bool fetchAnimationFrame(int index) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -211,13 +189,11 @@ void drawDancingText() {
 }
 
 void drawAnimationFrame(int index) {
-  Serial.printf("Displaying frame %d\n", index);
   display.clearDisplay();
   display.drawBitmap(0, 0, frameBitmap, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
   drawDancingText();
   display.display();
   lastDanceTick = millis();
-  animationDrawn = true;
 }
 
 // Keep the text moving between GIF frames (GIFs can have long delays).
@@ -229,7 +205,6 @@ void danceTick() {
 }
 
 void drawScreen() {
-  animationDrawn = false;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
@@ -256,10 +231,159 @@ void showStartup() {
   display.display();
 }
 
+// Redraw the message, but only if nothing else is on screen.
+void refreshText() {
+  if (screenMode == SCREEN_TEXT) drawScreen();
+}
+
+void enterTextMode() {
+  screenMode = SCREEN_TEXT;
+  shownFrame = -1;
+  shownEffect = TL_EFFECT_NONE;
+  drawScreen();
+}
+
+// ---- Effects: drawn on the device at the display's full 128x64 ---------------
+
+// Digital rain: 6x8 character cells, a bright head falling down each column
+// with a trail behind it. The whole screen is redrawn every tick.
+#define RAIN_COLS (SCREEN_WIDTH / 6)
+#define RAIN_ROWS (SCREEN_HEIGHT / 8)
+int16_t rainHead[RAIN_COLS];
+uint8_t rainLen[RAIN_COLS];
+uint32_t rainTick = 0;
+
+void startRain() {
+  for (int c = 0; c < RAIN_COLS; c++) {
+    rainHead[c] = -(int)(esp_random() % RAIN_ROWS);
+    rainLen[c] = 3 + esp_random() % 5;
+  }
+}
+
+char rainGlyph(int col, int row, uint32_t salt) {
+  return (char)(33 + ((col * 31 + row * 17 + salt * 7) % 94));
+}
+
+void tickRain() {
+  display.clearDisplay();
+  rainTick++;
+
+  for (int c = 0; c < RAIN_COLS; c++) {
+    int head = rainHead[c];
+
+    for (int k = 0; k < rainLen[c]; k++) {
+      int row = head - k;
+      if (row < 0 || row >= RAIN_ROWS) continue;
+
+      if (k == 0) {
+        // The head is a white block with the glyph cut out of it.
+        display.fillRect(c * 6, row * 8, 6, 8, SSD1306_WHITE);
+        display.drawChar(c * 6, row * 8, rainGlyph(c, row, rainTick), SSD1306_BLACK, SSD1306_WHITE, 1);
+      } else if (k < 3 || (k + row) % 2 == 0) {
+        // The trail thins out so it reads as fading on a 1-bit display.
+        display.drawChar(c * 6, row * 8, rainGlyph(c, row, rainTick / 4), SSD1306_WHITE, SSD1306_BLACK, 1);
+      }
+    }
+
+    rainHead[c]++;
+    if (rainHead[c] - rainLen[c] >= RAIN_ROWS) {
+      rainHead[c] = -(int)(esp_random() % 6);
+      rainLen[c] = 3 + esp_random() % 5;
+    }
+  }
+
+  display.display();
+}
+
+// Static: every pixel random.
+void tickStatic() {
+  uint32_t *words = (uint32_t *)display.getBuffer();
+  for (int i = 0; i < 1024 / 4; i++) words[i] = esp_random();
+  display.display();
+}
+
+void tickEffect() {
+  unsigned long now = millis();
+  if (now - lastEffectTick < EFFECT_TICK_MS) return;
+  lastEffectTick = now;
+
+  if (shownEffect == TL_EFFECT_RAIN) tickRain();
+  else if (shownEffect == TL_EFFECT_STATIC) tickStatic();
+}
+
+// ---- Playback ----------------------------------------------------------------
+
+// Put the target on screen. Content that is already showing is left alone.
+void drawTarget() {
+  if (target.kind == TL_IDLE) {
+    if (screenMode != SCREEN_TEXT) enterTextMode();
+    return;
+  }
+
+  if (target.kind == TL_EFFECT) {
+    if (screenMode != SCREEN_EFFECT || shownEffect != target.effect) {
+      screenMode = SCREEN_EFFECT;
+      shownFrame = -1;
+      shownEffect = target.effect;
+      lastEffectTick = 0;
+      if (shownEffect == TL_EFFECT_RAIN) startRain();
+    }
+    return;
+  }
+
+  if (screenMode == SCREEN_GIF && shownFrame == target.frame) return;
+
+  drawAnimationFrame(target.frame);
+  screenMode = SCREEN_GIF;
+  shownFrame = target.frame;
+  shownEffect = TL_EFFECT_NONE;
+}
+
+void playTimeline() {
+  unsigned long now = millis();
+
+  // Starting out, or after a re-sync: draw whatever should be showing now.
+  if (!haveTarget) {
+    target = tlLocate(timeline, tlPosition(timeline, clock_, now));
+    changeAt = now;
+    targetReady = false;
+    haveTarget = true;
+  }
+
+  // Fetch the next frame as soon as we know which it is.
+  if (!targetReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
+    lastFrameFetch = now;
+
+    if (target.kind != TL_FRAME || (screenMode == SCREEN_GIF && shownFrame == target.frame)) {
+      targetReady = true;
+    } else {
+      targetReady = fetchAnimationFrame(target.frame);
+    }
+    now = millis();
+  }
+
+  if (targetReady && (long)(now - changeAt) >= 0) {
+    drawTarget();
+
+    // The next target comes from the clock rather than the previous target, so
+    // a slow fetch skips ahead instead of falling behind.
+    TlPos current = tlLocate(timeline, tlPosition(timeline, clock_, now));
+    changeAt = now + current.untilChangeMs;
+    target = tlLocate(timeline, tlPosition(timeline, clock_, changeAt));
+    targetReady = false;
+    lastFrameFetch = 0;
+  }
+
+  if (screenMode == SCREEN_EFFECT) tickEffect();
+
+  // Keep the message dancing between GIF frames (GIFs can have long delays).
+  if (screenMode == SCREEN_GIF) danceTick();
+}
+
 void pollServer() {
   if (WiFi.status() != WL_CONNECTED) {
     serverOnline = false;
-    drawScreen();
+    refreshText();
     return;
   }
 
@@ -270,7 +394,7 @@ void pollServer() {
 
   if (!http.begin(client, url)) {
     serverOnline = false;
-    drawScreen();
+    refreshText();
     return;
   }
 
@@ -288,15 +412,15 @@ void pollServer() {
       if (newText != currentText || newVersion != currentVersion) {
         currentText = newText;
         currentVersion = newVersion;
-        drawScreen();
+        refreshText();
       }
     } else {
       serverOnline = false;
-      drawScreen();
+      refreshText();
     }
   } else {
     serverOnline = false;
-    drawScreen();
+    refreshText();
   }
 
   http.end();
@@ -327,6 +451,8 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   currentText = "Waiting for server";
+  tlClear(timeline);
+  clock_.synced = false;
   drawScreen();
 }
 
@@ -341,25 +467,7 @@ void loop() {
     checkAnimation();
   }
 
-  if (animationFrameCount > 0) {
-    // Prefetch the next frame as soon as the previous one is on screen.
-    if (!frameReady && millis() - lastFrameFetch >= FRAME_RETRY_MS) {
-      lastFrameFetch = millis();
-      frameReady = fetchAnimationFrame(animationFrameIndex);
-    }
-
-    if (frameReady && (long)(millis() - nextFrameAt) >= 0) {
-      unsigned long now = millis();
-      drawAnimationFrame(animationFrameIndex);
-      scheduleNextFrame(now, animationFrameIndex);
-      animationFrameIndex = (animationFrameIndex + 1) % animationFrameCount;
-      frameReady = false;
-      lastFrameFetch = 0;
-    }
-
-    // Only once a frame is on screen; otherwise the band would dance over stale content.
-    if (animationDrawn) danceTick();
-  }
+  if (tlActive(timeline)) playTimeline();
 
   delay(10);
 }

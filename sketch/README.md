@@ -87,13 +87,19 @@ The server now supports multiple ESP32 devices. Each device:
 - Baud rate: 115200
 - Use for debugging connection issues and viewing the ESP32's IP address
 
+## Shared timeline code
+
+`timeline.h` is identical in all three sketch folders (the Arduino IDE only builds files inside the sketch). It works out what to show at any moment from the server's program and the device's own clock. Edit `esp-st7735/timeline.h`, copy it to the other two, and run `sketch/tests/run.sh`, which checks the copies match and runs its unit tests on your computer.
+
+Digital rain and static are drawn by each sketch itself, at that display's full resolution (240×320, 128×64, 32×8).
+
 ## Sketch Behavior
 
 All sketches:
 1. Connect to Wi-Fi on startup
 2. Poll `/api/message?device=<name>&screen=<type>` every 2 seconds for text updates
 3. Poll `/api/animation?device=<name>` every 2 seconds for animation updates
-4. Display animation frames when available (priority over text)
+4. Play the server's program for the device (GIFs, effects, waits) in step with the other displays; waits and idle time show the text
 5. Show server connection status on the display
 
 The server automatically registers devices when they first poll, so no manual setup is required beyond configuring the `DEVICE_NAME` in secrets.h.

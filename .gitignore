@@ -46,8 +46,10 @@ env/
 # ESP32 secrets
 secrets.h
 
-# Device registry
+# Server data: device registry, saved shows, GIF library
 devices.json
+shows.json
+gifs/
 
 # Logs
 *.log

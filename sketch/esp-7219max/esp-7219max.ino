@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <MD_MAX72xx.h>
 #include <secrets.h>
+#include "timeline.h"
 
 #define MATRIX_HARDWARE MD_MAX72XX::FC16_HW
 #define MATRIX_DEVICES 4
@@ -17,24 +18,30 @@ const unsigned long ANIMATION_CHECK_MS = 2000;
 
 MD_MAX72XX matrix(MATRIX_HARDWARE, MATRIX_CS, MATRIX_DEVICES);
 
+// What the server told us to play (see timeline.h), and our clock against it.
+Timeline timeline;
+TlClock clock_;
 int animationVersion = -1;
-int animationFrameCount = 0;
-int animationFrameIndex = 0;
-unsigned long animationFrameMs = 120;
 
-// Per-frame display time from the GIF. Falls back to animationFrameMs.
-#define MAX_ANIMATION_FRAMES 60
-uint16_t frameDelays[MAX_ANIMATION_FRAMES];
-// The next frame is fetched right after the current one is drawn, then drawn
-// at nextFrameAt. Network latency therefore only matters if a fetch takes
-// longer than the frame's delay.
-bool frameReady = false;         // buffer holds frame animationFrameIndex
-bool animationResync = true;     // next draw starts a fresh schedule
-unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
+// Playback: "target" is what to draw next, at changeAt (device millis). Its
+// frame is fetched ahead of time, so network latency only matters if a fetch
+// takes longer than the time before the change.
+bool haveTarget = false;
+TlPos target;
+bool targetReady = false;
+unsigned long changeAt = 0;
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
 uint8_t frameBitmap[SOURCE_BYTES];
 unsigned long lastAnimationCheck = 0;
+
+// What is on the matrix. There is no text screen: a wait just clears it.
+enum ScreenMode { SCREEN_BLANK, SCREEN_GIF, SCREEN_EFFECT };
+ScreenMode screenMode = SCREEN_BLANK;
+int shownFrame = -1;
+int shownEffect = TL_EFFECT_NONE;
+const unsigned long EFFECT_TICK_MS = 80;
+unsigned long lastEffectTick = 0;
 
 void showMatrixFrame(const uint8_t* bitmap) {
   matrix.clear();
@@ -54,6 +61,7 @@ void showMatrixFrame(const uint8_t* bitmap) {
   }
 }
 
+// Ask the server what to play. Returns false if it couldn't be reached.
 bool checkAnimation() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -64,77 +72,52 @@ bool checkAnimation() {
   if (!http.begin(client, url)) return false;
   http.setTimeout(3000);
 
+  unsigned long sentAt = millis();
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     http.end();
     return false;
   }
 
-  JSONVar info = JSON.parse(http.getString());
+  String response = http.getString();
+  unsigned long receivedAt = millis();
   http.end();
+
+  JSONVar info = JSON.parse(response);
 
   if (JSON.typeof(info) == "undefined") return false;
 
   int newVersion = (int)info["version"];
-  int newFrameCount = (int)info["frame_count"];
-  int newFrameMs = (int)info["frame_ms"];
-
-  if (newFrameMs > 0) animationFrameMs = newFrameMs;
-  loadFrameDelays(info);
 
   if (newVersion != animationVersion) {
     animationVersion = newVersion;
-    animationFrameCount = newFrameCount;
-    animationFrameIndex = 0;
-    restartAnimationSchedule();
+    haveTarget = false;
+    targetReady = false;
+    clock_.synced = false;
+
+    if (!tlLoadJson(timeline, info)) {
+      Serial.println("Bad program, ignoring it");
+      tlClear(timeline);
+    }
+
+    // Clear whatever was playing.
+    screenMode = SCREEN_BLANK;
+    shownFrame = -1;
+    shownEffect = TL_EFFECT_NONE;
+    matrix.clear();
+  }
+
+  if (tlActive(timeline)) {
+    uint32_t position = (uint32_t)(int)info["program"]["position_ms"];
+    unsigned long midpoint = sentAt + (receivedAt - sentAt) / 2;
+
+    if (tlSync(timeline, clock_, midpoint, position, false)) {
+      haveTarget = false;
+      targetReady = false;
+    }
   }
 
   return true;
-}
-
-// Read the per-frame delays the server sends from the GIF's metadata.
-void loadFrameDelays(JSONVar& info) {
-  JSONVar delays = info["frame_delays"];
-  int count = 0;
-
-  if (JSON.typeof(delays) == "array") {
-    count = delays.length();
-    if (count > MAX_ANIMATION_FRAMES) count = MAX_ANIMATION_FRAMES;
-  }
-
-  for (int i = 0; i < MAX_ANIMATION_FRAMES; i++) {
-    int ms = (i < count) ? (int)delays[i] : 0;
-    frameDelays[i] = (ms > 0 && ms < 65535) ? ms : 0;
-  }
-}
-
-unsigned long delayForFrame(int index) {
-  if (index >= 0 && index < MAX_ANIMATION_FRAMES && frameDelays[index] > 0) {
-    return frameDelays[index];
-  }
-  return animationFrameMs;
-}
-
-// Set the deadline for the frame after the one drawn at "now". The deadline
-// advances by exactly the frame's delay so timing doesn't drift; if we have
-// fallen a whole frame behind (slow network), restart the schedule instead.
-void scheduleNextFrame(unsigned long now, int drawnIndex) {
-  unsigned long d = delayForFrame(drawnIndex);
-
-  if (animationResync || (long)(now - nextFrameAt) >= (long)d) {
-    nextFrameAt = now + d;
-  } else {
-    nextFrameAt += d;
-  }
-
-  animationResync = false;
-}
-
-// Throw away any prefetched frame and start the schedule over.
-void restartAnimationSchedule() {
-  frameReady = false;
-  animationResync = true;
-  nextFrameAt = millis();
 }
 
 // Download a frame into frameBitmap without drawing it.
@@ -161,6 +144,146 @@ bool fetchFrame(int index) {
   http.end();
 
   return received == sizeof(frameBitmap);
+}
+
+// ---- Effects: drawn on the matrix at its native 32x8 -----------------------
+
+// Draw into the matrix in one go instead of sending every point.
+void beginDraw() {
+  matrix.control(MD_MAX72XX::UPDATE, MD_MAX72XX::OFF);
+}
+
+void endDraw() {
+  matrix.control(MD_MAX72XX::UPDATE, MD_MAX72XX::ON);
+  matrix.update();
+}
+
+#define RAIN_COLS 32
+#define RAIN_ROWS 8
+int16_t rainHead[RAIN_COLS];
+uint8_t rainLen[RAIN_COLS];
+
+void startRain() {
+  for (int c = 0; c < RAIN_COLS; c++) {
+    rainHead[c] = -(int)(esp_random() % RAIN_ROWS);
+    rainLen[c] = 2 + esp_random() % 4;
+  }
+}
+
+// Digital rain: a falling streak in each column.
+void tickRain() {
+  beginDraw();
+  matrix.clear();
+
+  for (int c = 0; c < RAIN_COLS; c++) {
+    for (int k = 0; k < rainLen[c]; k++) {
+      int row = rainHead[c] - k;
+      if (row >= 0 && row < RAIN_ROWS) matrix.setPoint(row, c, true);
+    }
+
+    rainHead[c]++;
+    if (rainHead[c] - rainLen[c] >= RAIN_ROWS) {
+      rainHead[c] = -(int)(esp_random() % 6);
+      rainLen[c] = 2 + esp_random() % 4;
+    }
+  }
+
+  endDraw();
+}
+
+// Static: every pixel random.
+void tickStatic() {
+  beginDraw();
+
+  for (int c = 0; c < RAIN_COLS; c++) {
+    uint32_t bits = esp_random();
+    for (int row = 0; row < RAIN_ROWS; row++) {
+      matrix.setPoint(row, c, (bits >> row) & 1);
+    }
+  }
+
+  endDraw();
+}
+
+void tickEffect() {
+  unsigned long now = millis();
+  if (now - lastEffectTick < EFFECT_TICK_MS) return;
+  lastEffectTick = now;
+
+  if (shownEffect == TL_EFFECT_RAIN) tickRain();
+  else if (shownEffect == TL_EFFECT_STATIC) tickStatic();
+}
+
+// ---- Playback ------------------------------------------------------------------
+
+// Put the target on the matrix. Content that is already showing is left alone.
+void drawTarget() {
+  if (target.kind == TL_IDLE) {
+    if (screenMode != SCREEN_BLANK) {
+      matrix.clear();
+      screenMode = SCREEN_BLANK;
+      shownFrame = -1;
+      shownEffect = TL_EFFECT_NONE;
+    }
+    return;
+  }
+
+  if (target.kind == TL_EFFECT) {
+    if (screenMode != SCREEN_EFFECT || shownEffect != target.effect) {
+      screenMode = SCREEN_EFFECT;
+      shownFrame = -1;
+      shownEffect = target.effect;
+      lastEffectTick = 0;
+      matrix.clear();
+      if (shownEffect == TL_EFFECT_RAIN) startRain();
+    }
+    return;
+  }
+
+  if (screenMode == SCREEN_GIF && shownFrame == target.frame) return;
+
+  showMatrixFrame(frameBitmap);
+  screenMode = SCREEN_GIF;
+  shownFrame = target.frame;
+  shownEffect = TL_EFFECT_NONE;
+}
+
+void playTimeline() {
+  unsigned long now = millis();
+
+  // Starting out, or after a re-sync: draw whatever should be showing now.
+  if (!haveTarget) {
+    target = tlLocate(timeline, tlPosition(timeline, clock_, now));
+    changeAt = now;
+    targetReady = false;
+    haveTarget = true;
+  }
+
+  // Fetch the next frame as soon as we know which it is.
+  if (!targetReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
+    lastFrameFetch = now;
+
+    if (target.kind != TL_FRAME || (screenMode == SCREEN_GIF && shownFrame == target.frame)) {
+      targetReady = true;
+    } else {
+      targetReady = fetchFrame(target.frame);
+    }
+    now = millis();
+  }
+
+  if (targetReady && (long)(now - changeAt) >= 0) {
+    drawTarget();
+
+    // The next target comes from the clock rather than the previous target, so
+    // a slow fetch skips ahead instead of falling behind.
+    TlPos current = tlLocate(timeline, tlPosition(timeline, clock_, now));
+    changeAt = now + current.untilChangeMs;
+    target = tlLocate(timeline, tlPosition(timeline, clock_, changeAt));
+    targetReady = false;
+    lastFrameFetch = 0;
+  }
+
+  if (screenMode == SCREEN_EFFECT) tickEffect();
 }
 
 void setup() {
@@ -190,6 +313,8 @@ void setup() {
   Serial.println(WiFi.localIP());
   
   matrix.clear();
+  tlClear(timeline);
+  clock_.synced = false;
 }
 
 void loop() {
@@ -206,23 +331,7 @@ void loop() {
     checkAnimation();
   }
 
-  if (animationFrameCount > 0) {
-    // Prefetch the next frame as soon as the previous one is on screen.
-    if (!frameReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
-      lastFrameFetch = now;
-      frameReady = fetchFrame(animationFrameIndex);
-    }
-
-    now = millis();
-
-    if (frameReady && (long)(now - nextFrameAt) >= 0) {
-      showMatrixFrame(frameBitmap);
-      scheduleNextFrame(now, animationFrameIndex);
-      animationFrameIndex = (animationFrameIndex + 1) % animationFrameCount;
-      frameReady = false;
-      lastFrameFetch = 0;
-    }
-  }
+  if (tlActive(timeline)) playTimeline();
 
   delay(10);
 }

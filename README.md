@@ -10,6 +10,7 @@ A Mac-hosted Flask web server that lets you publish text or GIF animations to mu
 - **Auto-registration**: Devices automatically register when they first connect
 - **Real-time polling**: ESP32 devices poll the server every 2 seconds for updates
 - **Device management UI**: Web interface to view, edit, and delete devices
+- **GIF shows**: Sequence GIFs, waits and built-in effects (digital rain, static) on one display or across several, in sync
 - **Multiple display types**: Supports SSD1306 OLED, ST7735 TFT, and 7219MAX dot matrix displays
 - **Dark mode web interface**: Clean, responsive UI for publishing messages and animations
 
@@ -94,6 +95,7 @@ The server can be configured via environment variables. Copy `.env.example` to `
 - `MAX_GIF_BYTES`: Maximum GIF upload size in bytes (default: `5242880`)
 - `MAX_FRAMES`: Maximum number of frames to process (default: `60`)
 - `DEVICE_TIMEOUT_SECONDS`: Time before device is considered offline (default: `10`)
+- `DATA_DIR`: Where `devices.json`, `shows.json` and the `gifs/` library are kept (default: `.`)
 - `LOG_LEVEL`: Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, default: `INFO`)
 
 ## Web Interface
@@ -222,42 +224,61 @@ Returns animation metadata for the specified device.
 #### `GET /api/animation/frame/<index>?device=<name>`
 Returns a single monochrome animation frame as binary data (1,024 bytes, 128×64 pixels, 1-bit packed).
 
-#### `GET /api/animation/rgb565?device=<name>`
-Returns color animation metadata for the specified device.
-
-**Response**:
-```json
-{
-  "version": 1,
-  "frame_count": 24,
-  "frame_ms": 120,
-  "width": 128,
-  "height": 64,
-  "format": "rgb565-be",
-  "frame_bytes": 16384
-}
-```
-
-#### `GET /api/animation/rgb565/frame/<index>?device=<name>`
-Returns a single color animation frame as binary data (16,384 bytes, 128×64 pixels, RGB565 big-endian).
-
 #### `GET /api/animation/jpeg?device=<name>`
-Returns JPEG animation metadata for the specified device (optimized for ST7735 240×320 displays).
-
-**Response**:
-```json
-{
-  "version": 1,
-  "frame_count": 24,
-  "frame_ms": 120,
-  "width": 240,
-  "height": 320,
-  "format": "jpeg"
-}
-```
+Metadata for the color (ST7735) frames. The URL is a historical name: the frames are raw RGB332, one byte per pixel, not JPEG. Adds `width`, `height`, `x`, `y` (the first GIF's size and position), `format` (`"rgb332"`) and `frame_bytes`.
 
 #### `GET /api/animation/jpeg/frame/<index>?device=<name>`
-Returns a single JPEG animation frame as binary data (compressed, typically 5-20KB depending on content, 240×320 pixels).
+One RGB332 frame as binary data. `index` counts across all of the device's GIFs.
+
+Both metadata endpoints include `program` whenever something is playing (see Shows below).
+
+### Shows
+
+A show has one **lane per display**. A lane is an ordered list of steps, played in order and then looped:
+
+- **GIF**: a library GIF, repeated for the step's number of seconds (cut off when time runs out)
+- **Wait**: the display shows its text message
+- **Effect**: `rain` (digital rain) or `static`, drawn by the device itself at the display's full native resolution
+
+All lanes start together and share one cycle (the longest lane). Shorter lanes show their text for the rest. Use waits to stagger a GIF from one display to the next. Devices are told how far into the cycle the show is each time they poll, so displays stay in step to within a poll's network jitter. Sending a message to a display takes it out of the show.
+
+A lane can hold at most 24 steps, 16 different GIFs and `MAX_FRAMES` frames in total. If the GIFs add up to more frames than that, they are thinned evenly (keeping their lengths) and the response says so.
+
+Build shows at `/shows`, or through the API:
+
+- `GET /api/gifs`, `POST /api/gifs` (multipart `gif`), `GET /api/gifs/<id>/file`, `DELETE /api/gifs/<id>` (refused while a show uses it)
+- `GET /api/shows`, `POST /api/shows`, `GET|PUT|DELETE /api/shows/<id>`
+- `POST /api/shows/<id>/play` renders every lane and starts them together; `POST /api/shows/<id>/stop`
+
+```json
+{
+  "name": "Chase",
+  "lanes": [
+    {"device": "oled", "steps": [
+      {"type": "gif", "gif": "<id>", "seconds": 5},
+      {"type": "wait", "seconds": 5}]},
+    {"device": "tft", "steps": [
+      {"type": "wait", "seconds": 5},
+      {"type": "effect", "effect": "rain", "seconds": 5}]}
+  ]
+}
+```
+
+`POST /api/animation?device=<name>` still uploads a GIF and plays it on one device straight away; the GIF is also added to the library.
+
+The `program` the devices read:
+
+```json
+{
+  "position_ms": 1250,
+  "cycle_ms": 10000,
+  "steps": [{"clip": 0, "start_ms": 0, "duration_ms": 5000},
+            {"clip": -1, "start_ms": 5000, "duration_ms": 5000}],
+  "clips": [{"first_frame": 0, "frame_count": 24, "width": 80, "height": 60, "x": 80, "y": 130}]
+}
+```
+
+`clip` is an index into `clips`, `-1` for a wait, or `-2` for an effect (then `effect` is `1` rain, `2` static).
 
 ### Status & Health
 
@@ -290,17 +311,32 @@ Health check endpoint for monitoring.
 
 ## GIF Processing
 
-When a GIF is uploaded:
-1. Each frame is converted to RGBA and composited onto a black background
-2. Frames are resized to fit within 128×64 while preserving aspect ratio
-3. Images are centered on the canvas
-4. Frames are converted to three formats:
-   - **Monochrome**: 1-bit (grayscale threshold at 128), packed row by row, 8 pixels per byte, MSB first
-   - **Color (RGB565)**: 128×64 RGB565 big-endian, 2 bytes per pixel
-   - **JPEG**: 240×320 JPEG (for ST7735 displays), compressed to save ESP32 RAM
-5. Maximum 60 frames are processed (additional frames are ignored)
+GIFs are stored once in the library. When a show plays, each lane's GIFs are rendered for that display:
+1. Each frame is converted to RGBA and composited onto black, cropped to the visible content
+2. **Color (RGB332)**: scaled to fit 240×320 within a per-frame pixel budget, so the whole lane fits the ST7735's RAM cache
+3. **Monochrome**: 1-bit, dithered, packed MSB first (128×64), with the top 16 rows left black for the dancing text
+4. At most `MAX_FRAMES` frames are read from each GIF
 
-**Note**: Animations are stored in memory only and are lost when the server restarts. Device registry persists in `devices.json`.
+Rendered frames live in `devices.json`. Saved shows are in `shows.json` and the original GIFs in `gifs/`.
+
+## Project Layout
+
+```
+app.py                 entry point (python app.py)
+partytime/
+  config.py            environment settings and tuning constants
+  registry.py          device records, persistence
+  library.py           GIF library
+  shows.py             saved shows and their validation
+  program.py           renders a lane into frames + timeline
+  playback.py          starts and stops shows on devices
+  protocol.py          what devices are told (metadata, program)
+  media/               GIF decoding, pixel encoding
+  routes/              one blueprint per area (pages, messages, animation, devices, gifs, shows)
+templates/, static/    web UI
+sketch/                firmware (see sketch/README.md)
+tests/                 python -m unittest discover tests
+```
 
 ## Multi-Device Architecture
 
@@ -315,7 +351,7 @@ When a GIF is uploaded:
 
 ### Screen Type Handling
 - Devices advertise their screen type via the `screen` query parameter
-- Different screen types may use different animation endpoints (e.g., ST7735 uses `/api/animation/rgb565`)
+- Different screen types use different animation endpoints (ST7735 uses `/api/animation/jpeg`; the others use `/api/animation`)
 - ESP32 sketches choose the appropriate endpoint based on their display type
 
 ## Troubleshooting
@@ -339,7 +375,6 @@ When a GIF is uploaded:
 - Ensure GIF is converted to the correct format for your display type
 - Check that frame packing matches your display's format
 - Verify hardware connections for your specific display type
-- For color displays, ensure you're using the RGB565 endpoint
 
 ### Arduino IDE not seeing the board
 - Check USB cable (data cables required, not charge-only)
