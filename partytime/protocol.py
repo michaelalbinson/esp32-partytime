@@ -51,6 +51,7 @@ def program_info(anim, now=None):
         "cycle_ms": anim["cycle_ms"],
         "steps": anim["steps"],
         "clips": anim["clips"],
+        "texts": anim.get("texts", []),
     }
 
 

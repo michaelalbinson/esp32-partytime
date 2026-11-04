@@ -10,7 +10,7 @@ A Mac-hosted Flask web server that lets you publish text or GIF animations to mu
 - **Auto-registration**: Devices automatically register when they first connect
 - **Real-time polling**: ESP32 devices poll the server every 2 seconds for updates
 - **Device management UI**: Web interface to view, edit, and delete devices
-- **GIF shows**: Sequence GIFs, waits and built-in effects (digital rain, static) on one display or across several, in sync
+- **GIF shows**: Sequence GIFs, waits, built-in effects (digital rain, equalizer, radar, ...) and styled text (marquee, flash words, wavy) on one display or across several, in sync
 - **Multiple display types**: Supports SSD1306 OLED, ST7735 TFT, and 7219MAX dot matrix displays
 - **Dark mode web interface**: Clean, responsive UI for publishing messages and animations
 
@@ -238,7 +238,20 @@ A show has one **lane per display**. A lane is an ordered list of steps, played 
 
 - **GIF**: a library GIF, repeated for the step's number of seconds (cut off when time runs out)
 - **Wait**: the display shows its text message
-- **Effect**: `rain` (digital rain) or `static`, drawn by the device itself at the display's full native resolution
+- **Effect**: drawn by the device itself at the display's full native resolution. Each moves by the show clock, so they match across displays:
+
+  | `effect` | Looks like |
+  |---|---|
+  | `rain` | digital rain |
+  | `static` | TV static |
+  | `equalizer` | audio-visualizer bars |
+  | `scanner` | a Cylon / Knight Rider sweep |
+  | `radar` | a rotating radar sweep with blips |
+  | `testpattern` | color bars (patterns on mono displays) |
+  | `snow`, `confetti` | falling flakes / colored bits |
+  | `bounce` | the device name bouncing around like a DVD logo |
+
+- **Text**: text the device draws in a `style`: `marquee` (scrolling), `flash` (one word at a time, as big as fits) or `wave` (the text filling the screen, each letter bobbing). Up to 100 plain-ASCII characters; anything else becomes `?`. Leave `text` blank to use the display's own message as it is when the show starts, and a lane can use up to 8 different texts.
 
 All lanes start together and share one cycle (the longest lane). Shorter lanes show their text for the rest. Use waits to stagger a GIF from one display to the next. Devices are told how far into the cycle the show is each time they poll, so displays stay in step to within a poll's network jitter. Sending a message to a display takes it out of the show.
 
@@ -259,7 +272,8 @@ Build shows at `/shows`, or through the API:
       {"type": "wait", "seconds": 5}]},
     {"device": "tft", "steps": [
       {"type": "wait", "seconds": 5},
-      {"type": "effect", "effect": "rain", "seconds": 5}]}
+      {"type": "effect", "effect": "rain", "seconds": 5},
+      {"type": "text", "style": "marquee", "text": "PARTY TIME", "seconds": 8}]}
   ]
 }
 ```
@@ -274,11 +288,12 @@ The `program` the devices read:
   "cycle_ms": 10000,
   "steps": [{"clip": 0, "start_ms": 0, "duration_ms": 5000},
             {"clip": -1, "start_ms": 5000, "duration_ms": 5000}],
-  "clips": [{"first_frame": 0, "frame_count": 24, "width": 80, "height": 60, "x": 80, "y": 130}]
+  "clips": [{"gif": "<id>", "first_frame": 0, "frame_count": 24, "width": 80, "height": 60, "x": 80, "y": 130}],
+  "texts": ["PARTY TIME"]
 }
 ```
 
-`clip` is an index into `clips`, `-1` for a wait, or `-2` for an effect (then `effect` is `1` rain, `2` static).
+`clip` is an index into `clips`, `-1` for a wait, `-2` for an effect (then `effect` is its number, see `EFFECTS` in `partytime/config.py`), or `-3` for text (then `style` is `1` marquee, `2` flash, `3` wave, and `text` is an index into `texts`).
 
 ### Status & Health
 

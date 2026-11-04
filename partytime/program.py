@@ -3,8 +3,8 @@ Building a device's program: the rendered frames and timeline for one lane.
 
 A program is a list of steps played in order, then looped. A step is either a
 GIF shown for a fixed time (the GIF repeats, and is cut off when time runs out)
-a wait, during which the device shows its text message, or an effect the
-device draws itself. All the lane's GIFs
+a wait, during which the device shows its text message, an effect the device
+draws itself, or text in one of a few styles. All the lane's GIFs
 are rendered up front into one flat list of frames; each GIF ("clip") owns a
 run of it.
 """
@@ -27,6 +27,19 @@ WAIT = None  # step reference for a wait
 
 class Effect(namedtuple("Effect", "name")):
     """Step reference for an effect the device draws itself."""
+
+
+class Text(namedtuple("Text", "style text")):
+    """Step reference for text the device draws in a style (see TEXT_STYLES)."""
+
+
+def clean_text(text):
+    """Plain printable ASCII, single-spaced, within the length limit."""
+    ascii_text = "".join(
+        ch if " " <= ch <= "~" else ("?" if ord(ch) > 126 else " ")
+        for ch in text
+    )
+    return " ".join(ascii_text.split())[:config.MAX_TEXT_LENGTH]
 
 
 class ProgramError(Exception):
@@ -71,7 +84,7 @@ def merge_delays(delays, picked):
 def build_animation(steps, sources):
     """
     Render a lane. steps is a list of (gif_id, duration_ms), with gif_id WAIT
-    for a wait or an Effect; sources maps gif id to GifSource.
+    for a wait, an Effect or a Text; sources maps gif id to GifSource.
 
     Returns (animation, notes). animation holds the rendered frames and
     timeline in the shape of a device's animation record, minus the fields that
@@ -143,6 +156,7 @@ def build_animation(steps, sources):
                 rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
             rgb332_frames.append(rgb_to_rgb332(rgb))
 
+    texts = []
     laid_out = []
     start_ms = 0
     for ref, duration_ms in steps:
@@ -152,6 +166,17 @@ def build_animation(steps, sources):
         elif isinstance(ref, Effect):
             step["clip"] = -2
             step["effect"] = config.EFFECTS[ref.name]
+        elif isinstance(ref, Text):
+            text = clean_text(ref.text)
+            if text not in texts:
+                texts.append(text)
+            if len(texts) > config.MAX_PROGRAM_TEXTS:
+                raise ProgramError(
+                    f"Too many different texts in one lane (max {config.MAX_PROGRAM_TEXTS})"
+                )
+            step["clip"] = -3
+            step["style"] = config.TEXT_STYLES[ref.style]
+            step["text"] = texts.index(text)
         else:
             step["clip"] = clip_ids.index(ref)
         laid_out.append(step)
@@ -163,6 +188,7 @@ def build_animation(steps, sources):
         "frame_delays_ms": delays,
         "clips": clips,
         "steps": laid_out,
+        "texts": texts,
         "cycle_ms": start_ms,
     }
     return animation, notes

@@ -3,9 +3,9 @@
 import logging
 import time
 
-from .config import EFFECTS
+from .config import EFFECTS, TEXT_STYLES
 from .media.gif import GifError
-from .program import WAIT, Effect, ProgramError, build_animation
+from .program import WAIT, Effect, ProgramError, Text, build_animation
 from .protocol import cycle_position_ms
 
 logger = logging.getLogger(__name__)
@@ -42,23 +42,51 @@ def install(registry, animations, show_id=None, started_at=None, cycle_ms=None):
                 "started_at": started_at,
                 "cycle_ms": cycle_ms or anim["cycle_ms"],
                 "show_id": show_id,
+                "resume": _resume_for(old, show_id),
             }
 
         registry.save()
 
 
-def _step_ref(step):
+def _step_ref(step, message):
     if step["type"] == "gif":
         return step["gif"]
     if step["type"] == "effect":
         return Effect(step["effect"])
+    if step["type"] == "text":
+        # Text left blank shows the display's own message as it is now. (A new
+        # message ends the show on that display anyway.)
+        return Text(step["style"], step["text"] or message)
     return WAIT
 
 
-def lane_steps(lane):
-    """A lane's steps as (gif id, Effect or WAIT, duration in ms)."""
+def _resume_for(old, new_show_id):
+    """
+    What a device should go back to when the show it is about to play stops:
+    the GIF it was looping, if any. A show started over another show inherits
+    that show's answer, so stopping always returns to the state from before
+    any show.
+    """
+    if new_show_id is None:
+        return None  # a plain upload has nothing to go back to
+
+    if old.get("show_id"):
+        return old.get("resume")
+
+    clips = old.get("clips") or []
+    if old.get("steps") and clips and clips[0].get("gif"):
+        return {"gif": clips[0]["gif"]}
+
+    return None
+
+
+def lane_steps(lane, message=""):
+    """
+    A lane's steps as (reference, duration in ms), where the reference is a
+    GIF id, Effect, Text or WAIT. message fills in text steps left blank.
+    """
     return [
-        (_step_ref(step), round(step["seconds"] * 1000))
+        (_step_ref(step, message), round(step["seconds"] * 1000))
         for step in lane["steps"]
     ]
 
@@ -86,12 +114,19 @@ def play_show(registry, library, show):
     except GifError as error:
         raise PlaybackError(str(error)) from error
 
+    with registry.lock:
+        messages = {
+            lane["device"]: registry.devices[lane["device"]]
+            .get("message", {}).get("text", "")
+            for lane in show["lanes"]
+        }
+
     animations = {}
     notes = {}
     try:
         for lane in show["lanes"]:
             animations[lane["device"]], notes[lane["device"]] = build_animation(
-                lane_steps(lane), sources
+                lane_steps(lane, messages[lane["device"]]), sources
             )
     except ProgramError as error:
         raise PlaybackError(f'{lane["device"]}: {error}') from error
@@ -129,7 +164,19 @@ def play_show(registry, library, show):
 
 
 EFFECT_NAMES = {code: name for name, code in EFFECTS.items()}
-EFFECT_LABELS = {"rain": "Digital rain", "static": "Static"}
+EFFECT_LABELS = {
+    "rain": "Digital rain",
+    "static": "Static",
+    "equalizer": "Equalizer",
+    "scanner": "Scanner",
+    "radar": "Radar",
+    "testpattern": "Test pattern",
+    "snow": "Snowfall",
+    "confetti": "Confetti",
+    "bounce": "Bouncing logo",
+}
+STYLE_NAMES = {code: name for name, code in TEXT_STYLES.items()}
+STYLE_LABELS = {"marquee": "Marquee", "flash": "Flash words", "wave": "Wavy text"}
 
 
 def now_playing(anim, library, shows, now=None):
@@ -157,6 +204,11 @@ def now_playing(anim, library, shows, now=None):
         gif_id = anim["clips"][step["clip"]].get("gif")
         entry = library.get(gif_id) if gif_id else None
         result.update(kind="gif", name=entry["name"] if entry else "GIF")
+    elif step and step["clip"] == -3:
+        style = STYLE_NAMES.get(step.get("style"), "text")
+        texts = anim.get("texts", [])
+        text = texts[step["text"]] if 0 <= step.get("text", -1) < len(texts) else ""
+        result.update(kind="text", name=f'{STYLE_LABELS.get(style, style)}: "{text}"')
     elif step and step["clip"] == -2:
         effect = EFFECT_NAMES.get(step.get("effect"), "effect")
         result.update(kind="effect", name=EFFECT_LABELS.get(effect, effect))
@@ -174,14 +226,53 @@ def playing_devices(registry, show_id):
         ]
 
 
-def stop_show(registry, show_id):
-    """Stop a show's lanes. Returns the names of the devices stopped."""
+def _render_resume(library, resume):
+    """Re-render the GIF a device was looping before a show, or None."""
+    if not resume or not resume.get("gif"):
+        return None
+
+    try:
+        source = library.load_source(resume["gif"])
+        animation, _ = build_animation(
+            [(resume["gif"], source.duration_ms)], {resume["gif"]: source}
+        )
+    except (GifError, ProgramError):
+        return None  # it was deleted or no longer renders: show the message
+
+    return animation
+
+
+def stop_show(registry, library, show_id):
+    """
+    Stop a show's lanes. Each device goes back to the GIF it was looping before
+    the show, or to its message if it wasn't playing anything. Returns
+    (stopped, restored): the device names stopped, and those put back on a GIF.
+    """
     with registry.lock:
         stopped = playing_devices(registry, show_id)
+        resumes = {
+            name: registry.devices[name]["animation"].get("resume")
+            for name in stopped
+        }
+
+    # Rendering takes a moment; don't hold the lock for it.
+    renders = {name: _render_resume(library, resume) for name, resume in resumes.items()}
+
+    restored = []
+    with registry.lock:
         for name in stopped:
-            registry.clear_animation(name)
+            info = registry.devices.get(name)
+            # Skip a device that has moved on (a new message, another show).
+            if not info or info["animation"].get("show_id") != show_id:
+                continue
+
+            if renders[name]:
+                install(registry, {name: renders[name]})
+                restored.append(name)
+            else:
+                registry.clear_animation(name)
 
         if stopped:
             registry.save()
 
-    return stopped
+    return stopped, restored

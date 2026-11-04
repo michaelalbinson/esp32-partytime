@@ -15,19 +15,36 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define TL_MAX_STEPS 24
 #define TL_MAX_CLIPS 16
 #define TL_MAX_FRAMES 60
+#define TL_MAX_TEXTS 8
+#define TL_TEXT_LEN 104  // 100 characters plus the terminator, with spare
 
 // TlStep.clip values below zero are not GIFs.
 #define TL_CLIP_WAIT (-1)
 #define TL_CLIP_EFFECT (-2)
+#define TL_CLIP_TEXT (-3)
 
 // Keep in step with EFFECTS in partytime/config.py.
 #define TL_EFFECT_NONE 0
 #define TL_EFFECT_RAIN 1
 #define TL_EFFECT_STATIC 2
+#define TL_EFFECT_EQUALIZER 3
+#define TL_EFFECT_SCANNER 4
+#define TL_EFFECT_RADAR 5
+#define TL_EFFECT_TESTPATTERN 6
+#define TL_EFFECT_SNOW 7
+#define TL_EFFECT_CONFETTI 8
+#define TL_EFFECT_BOUNCE 9  // the device's name bouncing around, DVD-style
+
+// Keep in step with TEXT_STYLES in partytime/config.py.
+#define TL_STYLE_NONE 0
+#define TL_STYLE_MARQUEE 1  // one line scrolling right to left
+#define TL_STYLE_FLASH 2    // one word at a time, as big as fits
+#define TL_STYLE_WAVE 3     // the text filling the screen, each letter bobbing
 
 // A device drifting further than this from the server's position is re-synced.
 // Smaller differences are network jitter and are left alone so playback
@@ -37,6 +54,8 @@
 struct TlStep {
   int16_t clip;        // index into clips, or TL_CLIP_*
   uint8_t effect;      // TL_EFFECT_* when clip == TL_CLIP_EFFECT
+  uint8_t style;       // TL_STYLE_* when clip == TL_CLIP_TEXT
+  int8_t text;         // index into Timeline.texts when clip == TL_CLIP_TEXT
   uint32_t startMs;
   uint32_t durationMs;
 };
@@ -53,12 +72,14 @@ struct Timeline {
   uint8_t stepCount;
   uint8_t clipCount;
   uint16_t frameCount;
+  uint8_t textCount;
   TlStep steps[TL_MAX_STEPS];
   TlClip clips[TL_MAX_CLIPS];
   uint16_t delays[TL_MAX_FRAMES];  // per-frame display time, all clips in order
+  char texts[TL_MAX_TEXTS][TL_TEXT_LEN];  // plain ASCII, NUL-terminated
 };
 
-enum TlKind { TL_IDLE, TL_FRAME, TL_EFFECT };
+enum TlKind { TL_IDLE, TL_FRAME, TL_EFFECT, TL_TEXT };
 
 // What should be on screen at a moment in the cycle.
 struct TlPos {
@@ -67,6 +88,8 @@ struct TlPos {
   int clip;                // TL_FRAME only
   int frame;               // TL_FRAME only: index into the lane's frame list
   int effect;              // TL_EFFECT only
+  int style;               // TL_TEXT only
+  int text;                // TL_TEXT only: index into Timeline.texts
   uint32_t untilChangeMs;  // how long this stays correct; always >= 1
 };
 
@@ -75,6 +98,7 @@ inline void tlClear(Timeline &tl) {
   tl.stepCount = 0;
   tl.clipCount = 0;
   tl.frameCount = 0;
+  tl.textCount = 0;
 }
 
 inline bool tlActive(const Timeline &tl) {
@@ -83,7 +107,7 @@ inline bool tlActive(const Timeline &tl) {
 
 // What to show at time t (ms into the cycle; wrapped if beyond it).
 inline TlPos tlLocate(const Timeline &tl, uint32_t t) {
-  TlPos pos = {TL_IDLE, -1, -1, -1, 0, 1};
+  TlPos pos = {TL_IDLE, -1, -1, -1, 0, 0, -1, 1};
 
   if (tl.cycleMs == 0) {
     return pos;
@@ -108,6 +132,13 @@ inline TlPos tlLocate(const Timeline &tl, uint32_t t) {
       if (step.clip == TL_CLIP_EFFECT) {
         pos.kind = TL_EFFECT;
         pos.effect = step.effect;
+        return pos;
+      }
+
+      if (step.clip == TL_CLIP_TEXT) {
+        pos.kind = TL_TEXT;
+        pos.style = step.style;
+        pos.text = step.text;
         return pos;
       }
 
@@ -158,6 +189,19 @@ struct TlClock {
 
 inline uint32_t tlPosition(const Timeline &tl, const TlClock &clock, uint32_t nowMs) {
   return tl.cycleMs ? (uint32_t)(nowMs - clock.startMs) % tl.cycleMs : 0;
+}
+
+// How long a step has been running, in ms: the time base for effects and text,
+// so that they move identically on every display of a show.
+inline uint32_t tlStepElapsed(const Timeline &tl, const TlClock &clock,
+                              uint32_t nowMs, int step) {
+  if (tl.cycleMs == 0 || step < 0 || step >= tl.stepCount) {
+    return 0;
+  }
+
+  uint32_t pos = tlPosition(tl, clock, nowMs);
+  uint32_t start = tl.steps[step].startMs;
+  return pos >= start ? pos - start : pos + tl.cycleMs - start;
 }
 
 // Signed distance from a to b around the cycle, in (-cycle/2, cycle/2].
@@ -212,9 +256,20 @@ inline bool tlLoadJson(Timeline &tl, JSONVar &info) {
   JSONVar steps = program["steps"];
   JSONVar clips = program["clips"];
   JSONVar delays = info["frame_delays"];
+  JSONVar texts = program["texts"];
 
   if (JSON.typeof(steps) != "array" || JSON.typeof(clips) != "array") {
     return false;
+  }
+
+  int textCount = (JSON.typeof(texts) == "array") ? texts.length() : 0;
+  if (textCount > TL_MAX_TEXTS) {
+    return false;
+  }
+
+  for (int i = 0; i < textCount; i++) {
+    strncpy(tl.texts[i], (const char *)texts[i], TL_TEXT_LEN - 1);
+    tl.texts[i][TL_TEXT_LEN - 1] = '\0';
   }
 
   int stepCount = steps.length();
@@ -255,10 +310,16 @@ inline bool tlLoadJson(Timeline &tl, JSONVar &info) {
     TlStep &step = tl.steps[i];
     step.clip = (int)s["clip"];
     step.effect = (JSON.typeof(s["effect"]) == "number") ? (int)s["effect"] : TL_EFFECT_NONE;
+    step.style = (JSON.typeof(s["style"]) == "number") ? (int)s["style"] : TL_STYLE_NONE;
+    step.text = (JSON.typeof(s["text"]) == "number") ? (int)s["text"] : -1;
     step.startMs = (uint32_t)(int)s["start_ms"];
     step.durationMs = (uint32_t)(int)s["duration_ms"];
 
-    if (step.clip >= clipCount || step.durationMs == 0) {
+    if (step.clip >= clipCount || step.clip < TL_CLIP_TEXT || step.durationMs == 0) {
+      return false;
+    }
+
+    if (step.clip == TL_CLIP_TEXT && (step.text < 0 || step.text >= textCount)) {
       return false;
     }
   }
@@ -266,6 +327,7 @@ inline bool tlLoadJson(Timeline &tl, JSONVar &info) {
   tl.stepCount = stepCount;
   tl.clipCount = clipCount;
   tl.frameCount = frameCount;
+  tl.textCount = textCount;
   tl.cycleMs = (uint32_t)(int)program["cycle_ms"];
   return true;
 }

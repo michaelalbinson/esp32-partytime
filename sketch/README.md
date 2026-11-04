@@ -91,7 +91,7 @@ The server now supports multiple ESP32 devices. Each device:
 
 `timeline.h` is identical in all three sketch folders (the Arduino IDE only builds files inside the sketch). It works out what to show at any moment from the server's program and the device's own clock. Edit `esp-st7735/timeline.h`, copy it to the other two, and run `sketch/tests/run.sh`, which checks the copies match and runs its unit tests on your computer.
 
-Digital rain and static are drawn by each sketch itself, at that display's full resolution (240×320, 128×64, 32×8).
+Effects (digital rain, static, equalizer, scanner, radar, test pattern, snow, confetti, bouncing logo) and the text styles (marquee, flash words, wavy) are drawn by each sketch itself, at that display's full resolution (240×320, 128×64, 32×8). They move by the show clock (`tlStepElapsed`), so every display of a show agrees on where they are.
 
 ## Sketch Behavior
 

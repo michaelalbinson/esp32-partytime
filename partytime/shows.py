@@ -2,7 +2,7 @@
 Shows: saved sequences of GIFs across displays.
 
 A show has one lane per display. A lane is an ordered list of steps, each a GIF
-shown for a number of seconds, a wait, or an effect (digital rain, static). Lanes start together and loop, so the
+shown for a number of seconds, a wait, an effect (digital rain, static, equalizer...), or text (marquee, flash words, wavy). Lanes start together and loop, so the
 same GIFs can play in sync on several displays, or staggered with waits so they
 chase from one display to the next.
 """
@@ -48,13 +48,30 @@ def _clean_step(step, library):
             raise ValidationError("Unknown effect")
         return {"type": "effect", "effect": effect, "seconds": seconds}
 
+    if kind == "text":
+        style = step.get("style")
+        if style not in config.TEXT_STYLES:
+            raise ValidationError("Unknown text style")
+
+        text = step.get("text", "")
+        if not isinstance(text, str):
+            raise ValidationError("Step text must be text")
+        text = text.strip()
+        if len(text) > config.MAX_TEXT_LENGTH:
+            raise ValidationError(
+                f"Step text must be {config.MAX_TEXT_LENGTH} characters or fewer"
+            )
+
+        # Blank text means "show the display's own message".
+        return {"type": "text", "style": style, "text": text, "seconds": seconds}
+
     if kind == "gif":
         gif_id = step.get("gif")
         if not isinstance(gif_id, str) or not library.get(gif_id):
             raise ValidationError("A step uses a GIF that isn't in the library")
         return {"type": "gif", "gif": gif_id, "seconds": seconds}
 
-    raise ValidationError('A step\'s type must be "gif", "wait" or "effect"')
+    raise ValidationError('A step\'s type must be "gif", "wait", "effect" or "text"')
 
 
 def clean_show(payload, library):

@@ -18,8 +18,10 @@ class GifLibrary:
     """
 
     def __init__(self, directory):
-        self.directory = directory
-        self.index_path = os.path.join(directory, "index.json")
+        # Absolute, because Flask's send_file resolves relative paths against
+        # the package folder rather than the working directory.
+        self.directory = os.path.abspath(directory)
+        self.index_path = os.path.join(self.directory, "index.json")
         self.lock = RLock()
         self.entries = load_json(self.index_path, {})
 

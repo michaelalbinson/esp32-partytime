@@ -27,9 +27,9 @@ static Timeline makeTimeline() {
   tl.clips[0] = {0, 4, 40, 30, 100, 145, 400};
 
   tl.stepCount = 3;
-  tl.steps[0] = {0, 0, 0, 2000};
-  tl.steps[1] = {TL_CLIP_WAIT, 0, 2000, 1500};
-  tl.steps[2] = {TL_CLIP_EFFECT, TL_EFFECT_RAIN, 3500, 500};
+  tl.steps[0] = {0, 0, 0, 0, 0, 2000};
+  tl.steps[1] = {TL_CLIP_WAIT, 0, 0, 0, 2000, 1500};
+  tl.steps[2] = {TL_CLIP_EFFECT, TL_EFFECT_RAIN, 0, 0, 3500, 500};
   return tl;
 }
 
@@ -77,6 +77,19 @@ int main() {
   }
   CHECK(t == 5000);
   CHECK(changes == 20 /*gif*/ + 1 /*wait*/ + 1 /*rain*/ + 1 /*idle*/);
+
+  // A text step reports its style and which text; step time is shared.
+  Timeline words = makeTimeline();
+  words.textCount = 1;
+  strcpy(words.texts[0], "HELLO WORLD");
+  words.steps[2] = {TL_CLIP_TEXT, 0, TL_STYLE_FLASH, 0, 3500, 500};
+  p = tlLocate(words, 3600);
+  CHECK(p.kind == TL_TEXT && p.style == TL_STYLE_FLASH && p.text == 0 && p.untilChangeMs == 400);
+
+  TlClock zero = {true, 0};
+  CHECK(tlStepElapsed(words, zero, 3600, 2) == 100);
+  CHECK(tlStepElapsed(words, zero, 5000 + 3600, 2) == 100);  // next cycle
+  CHECK(tlStepElapsed(words, zero, 100, 2) == 100 + 5000 - 3500);  // before it started this cycle
 
   // Nothing to play.
   Timeline empty;

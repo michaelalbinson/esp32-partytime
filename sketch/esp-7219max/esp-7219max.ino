@@ -36,12 +36,18 @@ uint8_t frameBitmap[SOURCE_BYTES];
 unsigned long lastAnimationCheck = 0;
 
 // What is on the matrix. There is no text screen: a wait just clears it.
-enum ScreenMode { SCREEN_BLANK, SCREEN_GIF, SCREEN_EFFECT };
+enum ScreenMode { SCREEN_BLANK, SCREEN_GIF, SCREEN_EFFECT, SCREEN_TEXT };
 ScreenMode screenMode = SCREEN_BLANK;
 int shownFrame = -1;
 int shownEffect = TL_EFFECT_NONE;
-const unsigned long EFFECT_TICK_MS = 80;
+int shownStep = -1;   // step index of the effect or text on screen (its time base)
+int shownText = -1;   // index into timeline.texts
+int shownStyle = TL_STYLE_NONE;
+const unsigned long EFFECT_TICK_MS = 80;       // rain and static
+const unsigned long EFFECT_TICK_FAST_MS = 60;  // the other effects
+const unsigned long TEXT_TICK_MS = 50;
 unsigned long lastEffectTick = 0;
+unsigned long lastTextTick = 0;
 
 void showMatrixFrame(const uint8_t* bitmap) {
   matrix.clear();
@@ -104,6 +110,8 @@ bool checkAnimation() {
     screenMode = SCREEN_BLANK;
     shownFrame = -1;
     shownEffect = TL_EFFECT_NONE;
+    shownText = -1;
+    shownStyle = TL_STYLE_NONE;
     matrix.clear();
   }
 
@@ -205,13 +213,328 @@ void tickStatic() {
   endDraw();
 }
 
+// ---- Drawing helpers ----------------------------------------------------------
+
+// The new effects and the text draw into a 32-column buffer (bit r of fb[c] is
+// row r of column c; row 0 is the top row) and push it to the matrix in one go.
+uint8_t fb[RAIN_COLS];
+
+void fbClear() {
+  memset(fb, 0, sizeof(fb));
+}
+
+void px(int c, int r, bool on = true) {
+  if (c < 0 || c >= RAIN_COLS || r < 0 || r >= RAIN_ROWS) return;
+  if (on) fb[c] |= (uint8_t)(1 << r);
+  else fb[c] &= (uint8_t)~(1 << r);
+}
+
+void fbFlush() {
+  beginDraw();
+  for (int c = 0; c < RAIN_COLS; c++) {
+    for (int r = 0; r < RAIN_ROWS; r++) {
+      matrix.setPoint(r, c, (fb[c] >> r) & 1);
+    }
+  }
+  endDraw();
+}
+
+const float TWO_PI_F = 6.2831853f;
+
+// Triangle wave: 0 -> 1 -> 0 over one period of x.
+float tri(float x) {
+  x -= floorf(x);
+  return x < 0.5f ? 2.0f * x : 2.0f - 2.0f * x;
+}
+
+// ---- Text, in the library's own 5x7 font ---------------------------------------
+//
+// The font's column bytes have bit 0 as the top row, the same as row 0 in
+// setPoint, and glyphs occupy rows 0-6. Widths vary by character.
+
+// Fetch a character's column bytes; returns its width in columns.
+uint8_t glyph(char c, uint8_t *buf) {
+  uint8_t w = matrix.getChar((uint8_t)c, 8, buf);
+  if (w == 0 && c != '?') w = matrix.getChar('?', 8, buf);
+  if (w == 0) {
+    memset(buf, 0, 8);
+    w = 3;
+  }
+  return w;
+}
+
+// Width in columns of len characters, with a 1 column gap between them.
+int textWidth(const char *s, int len) {
+  uint8_t buf[8];
+  int width = 0;
+  for (int i = 0; i < len; i++) {
+    width += glyph(s[i], buf) + (i > 0 ? 1 : 0);
+  }
+  return width;
+}
+
+// Draw one character with its top-left at (x, y); returns its width.
+int drawGlyph(char c, int x, int y) {
+  uint8_t buf[8];
+  uint8_t w = glyph(c, buf);
+
+  for (int i = 0; i < w; i++) {
+    for (int r = 0; r < 8; r++) {
+      if ((buf[i] >> r) & 1) px(x + i, y + r);
+    }
+  }
+  return w;
+}
+
+// Draw len characters; with wave, each bobs up and down by up to a row.
+void drawText(const char *s, int len, int x, int y, bool wave, uint32_t t) {
+  for (int i = 0; i < len; i++) {
+    int bob = wave ? (int)roundf(sinf(t * 0.008f + i * 0.7f)) : 0;
+    x += drawGlyph(s[i], x, y + bob) + 1;
+  }
+}
+
+// ---- More effects, all on the 32x8 matrix --------------------------------------
+// Everything that moves by time is a function of t, the time in ms since its
+// step started, so every display of a show moves the same way.
+
+// Equalizer: 32 bars rising from the bottom row.
+void tickEqualizer(uint32_t t) {
+  fbClear();
+  for (int i = 0; i < RAIN_COLS; i++) {
+    float level = (sinf(t * 0.004f * (1 + i % 3) + i * 1.7f) +
+                   sinf(t * 0.0027f * (1 + i % 4) + i * 0.9f) + 2.0f) / 4.0f * RAIN_ROWS;
+    int bar = (int)roundf(level);
+    for (int k = 0; k < bar; k++) px(i, RAIN_ROWS - 1 - k);
+  }
+  fbFlush();
+}
+
+// Scanner: a two-column head sweeping end to end, a dotted trail behind it.
+void tickScanner(uint32_t t) {
+  float phase = (t % 1600) / 1600.0f;
+  int head = (int)roundf(tri(phase) * (RAIN_COLS - 2));
+  int dir = phase < 0.5f ? 1 : -1;
+
+  fbClear();
+  for (int r = 0; r < RAIN_ROWS; r++) {
+    px(head, r);
+    px(head + 1, r);
+    if (r % 2 == 0) px(dir > 0 ? head - 1 : head + 2, r);
+  }
+  fbFlush();
+}
+
+// Radar: a rotating line in each 8x8 module, with two fainter lines behind it.
+void tickRadar(uint32_t t) {
+  float angle = TWO_PI_F * (t % 3000) / 3000.0f;
+
+  fbClear();
+  for (int m = 0; m < MATRIX_DEVICES; m++) {
+    float cx = m * 8 + 3.5f;
+    float cy = 3.5f;
+
+    for (int line = 0; line < 3; line++) {
+      float a = angle - line * 0.45f;
+      float step = line == 0 ? 0.5f : (line == 1 ? 1.0f : 1.5f);
+
+      for (float r = 0; r <= 3.5f; r += step) {
+        px((int)floorf(cx + r * cosf(a)), (int)floorf(cy + r * sinf(a)));
+      }
+    }
+  }
+  fbFlush();
+}
+
+// Test pattern: 7 groups of columns, each a different density.
+bool patternDrawn = false;
+
+void tickTestPattern() {
+  if (patternDrawn) return;
+  patternDrawn = true;
+
+  const int widths[7] = {5, 5, 5, 5, 4, 4, 4};
+
+  fbClear();
+  int c = 0;
+  for (int g = 0; g < 7; g++) {
+    for (int k = 0; k < widths[g]; k++, c++) {
+      for (int r = 0; r < RAIN_ROWS; r++) {
+        bool on = false;
+        switch (g) {
+          case 0: on = true; break;                  // solid
+          case 1: on = (c + r) % 4 != 0; break;      // three quarters
+          case 2: on = (c + r) % 2 == 0; break;      // checker
+          case 3: on = (c + r) % 4 == 0; break;      // one quarter
+          case 4: on = c % 2 == 0; break;            // vertical stripes
+          case 5: on = r % 2 == 0; break;            // horizontal stripes
+          default: on = false; break;                // empty
+        }
+        if (on) px(c, r);
+      }
+    }
+  }
+  fbFlush();
+}
+
+// Snow and confetti: single pixels falling and drifting sideways. These are
+// random, so they differ from display to display.
+#define MAX_FLAKES 10
+struct Flake {
+  float y;
+  float vy;  // rows per tick
+  int16_t x;
+};
+Flake flakes[MAX_FLAKES];
+int flakeCount = 0;
+
+void respawnFlake(int i, bool confetti, bool anywhere) {
+  flakes[i].x = esp_random() % RAIN_COLS;
+  flakes[i].y = anywhere ? (float)(esp_random() % RAIN_ROWS) : -(float)(esp_random() % 4);
+  flakes[i].vy = (confetti ? 0.35f : 0.15f) + (esp_random() % 30) / 100.0f;
+}
+
+void startFlakes(bool confetti) {
+  flakeCount = confetti ? 8 : 10;
+  for (int i = 0; i < flakeCount; i++) respawnFlake(i, confetti, true);
+}
+
+void tickFlakes(bool confetti) {
+  fbClear();
+  for (int i = 0; i < flakeCount; i++) {
+    flakes[i].y += flakes[i].vy;
+
+    if (esp_random() % (confetti ? 3 : 6) == 0) {
+      flakes[i].x += (esp_random() & 1) ? 1 : -1;
+      flakes[i].x = (flakes[i].x + RAIN_COLS) % RAIN_COLS;
+    }
+
+    if (flakes[i].y >= RAIN_ROWS) respawnFlake(i, confetti, false);
+    if (flakes[i].y >= 0) px(flakes[i].x, (int)flakes[i].y);
+  }
+  fbFlush();
+}
+
+// Bounce: the device name bounces off the edges (it bobs a row at each hit);
+// a name wider than the matrix ping-pongs so every part is seen.
+void tickBounce(uint32_t t) {
+  const char *name = DEVICE_NAME;
+  int len = strlen(name);
+  int width = textWidth(name, len);
+  int travel = abs(RAIN_COLS - width);
+
+  float distance = t * 0.012f;  // 12 columns per second
+  int x = 0;
+  int hits = 0;
+
+  if (travel > 0) {
+    x = (int)roundf(travel * tri(distance / (2.0f * travel)));
+    hits = (int)(distance / travel);
+  }
+
+  fbClear();
+  drawText(name, len, width <= RAIN_COLS ? x : -x, hits % 2, false, t);
+  fbFlush();
+}
+
 void tickEffect() {
   unsigned long now = millis();
-  if (now - lastEffectTick < EFFECT_TICK_MS) return;
+  bool slow = shownEffect == TL_EFFECT_RAIN || shownEffect == TL_EFFECT_STATIC;
+  if (now - lastEffectTick < (slow ? EFFECT_TICK_MS : EFFECT_TICK_FAST_MS)) return;
   lastEffectTick = now;
 
-  if (shownEffect == TL_EFFECT_RAIN) tickRain();
-  else if (shownEffect == TL_EFFECT_STATIC) tickStatic();
+  uint32_t t = tlStepElapsed(timeline, clock_, now, shownStep);
+
+  switch (shownEffect) {
+    case TL_EFFECT_RAIN: tickRain(); break;
+    case TL_EFFECT_STATIC: tickStatic(); break;
+    case TL_EFFECT_EQUALIZER: tickEqualizer(t); break;
+    case TL_EFFECT_SCANNER: tickScanner(t); break;
+    case TL_EFFECT_RADAR: tickRadar(t); break;
+    case TL_EFFECT_TESTPATTERN: tickTestPattern(); break;
+    case TL_EFFECT_SNOW: tickFlakes(false); break;
+    case TL_EFFECT_CONFETTI: tickFlakes(true); break;
+    case TL_EFFECT_BOUNCE: tickBounce(t); break;
+  }
+}
+
+// ---- Text steps ------------------------------------------------------------------
+
+// Where the n-th word of s starts and how long it is; false if there is none.
+bool nthWord(const char *s, int n, int *start, int *len) {
+  int i = 0;
+  while (s[i]) {
+    while (s[i] == ' ') i++;
+    if (!s[i]) break;
+
+    int begin = i;
+    while (s[i] && s[i] != ' ') i++;
+
+    if (n-- == 0) {
+      *start = begin;
+      *len = i - begin;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Marquee and wave: the line scrolls right to left, repeating, 30 columns a second.
+void drawScrolling(const char *s, uint32_t t, bool wave) {
+  int len = strlen(s);
+  int period = textWidth(s, len) + 8;
+  int offset = (int)((t * 30UL / 1000UL) % period);
+
+  for (int x = -offset; x < RAIN_COLS; x += period) {
+    drawText(s, len, x, 0, wave, t);
+  }
+}
+
+// Flash words: one word at a time, centered if it fits, otherwise scrolled
+// across its slot. A word's slot is 450 ms plus 40 ms per column too wide.
+void drawFlashWords(const char *s, uint32_t t) {
+  int start, len;
+  uint32_t total = 0;
+
+  for (int n = 0; nthWord(s, n, &start, &len); n++) {
+    int excess = textWidth(s + start, len) - RAIN_COLS;
+    total += 450 + (excess > 0 ? 40 * excess : 0);
+  }
+
+  if (total == 0) return;  // no words
+
+  uint32_t at = t % total;
+
+  for (int n = 0; nthWord(s, n, &start, &len); n++) {
+    int width = textWidth(s + start, len);
+    int excess = width - RAIN_COLS;
+    uint32_t slot = 450 + (excess > 0 ? 40 * excess : 0);
+
+    if (at < slot) {
+      int x = excess > 0 ? -(int)((uint32_t)excess * at / slot) : (RAIN_COLS - width) / 2;
+      drawText(s + start, len, x, 0, false, t);
+      return;
+    }
+    at -= slot;
+  }
+}
+
+void tickText() {
+  unsigned long now = millis();
+  if (now - lastTextTick < TEXT_TICK_MS) return;
+  lastTextTick = now;
+
+  if (shownText < 0 || shownText >= timeline.textCount) return;
+
+  const char *s = timeline.texts[shownText];
+  uint32_t t = tlStepElapsed(timeline, clock_, now, shownStep);
+
+  fbClear();
+  if (s[0]) {
+    if (shownStyle == TL_STYLE_FLASH) drawFlashWords(s, t);
+    else drawScrolling(s, t, shownStyle == TL_STYLE_WAVE);
+  }
+  fbFlush();
 }
 
 // ---- Playback ------------------------------------------------------------------
@@ -224,19 +547,45 @@ void drawTarget() {
       screenMode = SCREEN_BLANK;
       shownFrame = -1;
       shownEffect = TL_EFFECT_NONE;
+      shownText = -1;
+      shownStyle = TL_STYLE_NONE;
     }
     return;
   }
 
   if (target.kind == TL_EFFECT) {
-    if (screenMode != SCREEN_EFFECT || shownEffect != target.effect) {
+    // Back-to-back steps of the same effect carry on without a restart; only
+    // the time base moves to the new step.
+    bool changed = screenMode != SCREEN_EFFECT || shownEffect != target.effect;
+    shownStep = target.step;
+
+    if (changed) {
       screenMode = SCREEN_EFFECT;
       shownFrame = -1;
       shownEffect = target.effect;
+      shownText = -1;
+      shownStyle = TL_STYLE_NONE;
       lastEffectTick = 0;
       matrix.clear();
+
       if (shownEffect == TL_EFFECT_RAIN) startRain();
+      else if (shownEffect == TL_EFFECT_SNOW) startFlakes(false);
+      else if (shownEffect == TL_EFFECT_CONFETTI) startFlakes(true);
+      else if (shownEffect == TL_EFFECT_TESTPATTERN) patternDrawn = false;
     }
+    return;
+  }
+
+  if (target.kind == TL_TEXT) {
+    if (screenMode != SCREEN_TEXT) {
+      lastTextTick = 0;
+    }
+    screenMode = SCREEN_TEXT;
+    shownFrame = -1;
+    shownEffect = TL_EFFECT_NONE;
+    shownStep = target.step;
+    shownText = target.text;
+    shownStyle = target.style;
     return;
   }
 
@@ -246,6 +595,8 @@ void drawTarget() {
   screenMode = SCREEN_GIF;
   shownFrame = target.frame;
   shownEffect = TL_EFFECT_NONE;
+  shownText = -1;
+  shownStyle = TL_STYLE_NONE;
 }
 
 void playTimeline() {
@@ -284,6 +635,7 @@ void playTimeline() {
   }
 
   if (screenMode == SCREEN_EFFECT) tickEffect();
+  else if (screenMode == SCREEN_TEXT) tickText();
 }
 
 void setup() {

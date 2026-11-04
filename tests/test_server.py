@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from PIL import Image  # noqa: E402
 
 from partytime import create_app  # noqa: E402
-from partytime.program import allocate_frames, merge_delays, pick_frames  # noqa: E402
+from partytime.program import allocate_frames, clean_text, merge_delays, pick_frames  # noqa: E402
 from partytime.protocol import cycle_position_ms  # noqa: E402
 from partytime.registry import normalize_animation  # noqa: E402
 
@@ -54,6 +54,15 @@ class FrameMathTests(unittest.TestCase):
         anim = {"cycle_ms": 1000, "started_at": 100.0}
         self.assertEqual(cycle_position_ms(anim, now=100.25), 250)
         self.assertEqual(cycle_position_ms(anim, now=103.5), 500)
+
+
+class CleanTextTests(unittest.TestCase):
+    def test_keeps_plain_ascii_and_squashes_whitespace(self):
+        self.assertEqual(clean_text("  HAPPY   party\n time "), "HAPPY party time")
+
+    def test_replaces_non_ascii_and_truncates(self):
+        self.assertEqual(clean_text("caf\u00e9 \U0001f389"), "caf? ?")
+        self.assertEqual(len(clean_text("x" * 500)), 100)
 
 
 class LegacyMigrationTests(unittest.TestCase):
@@ -166,6 +175,74 @@ class ApiTests(unittest.TestCase):
         stopped = self.client.post(f"/api/shows/{show['id']}/stop").get_json()
         self.assertEqual(stopped["stopped"], ["tft"])
 
+    def quick_upload(self, device, name="quick.gif", **kwargs):
+        response = self.client.post(
+            f"/api/animation?device={device}",
+            data={"gif": (io.BytesIO(make_gif(**kwargs)), name)},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_stop_goes_back_to_what_was_playing_before_the_show(self):
+        self.quick_upload("oled", "before.gif", frame_count=5)
+        # tft was only showing its message.
+        show = self.make_show([
+            {"device": "oled", "steps": [{"type": "effect", "effect": "rain", "seconds": 2}]},
+            {"device": "tft", "steps": [{"type": "effect", "effect": "static", "seconds": 2}]},
+        ])
+        self.client.post(f"/api/shows/{show['id']}/play")
+        self.assertEqual(self.client.get("/api/devices/oled").get_json()["now_playing"]["kind"], "effect")
+
+        stopped = self.client.post(f"/api/shows/{show['id']}/stop").get_json()
+        self.assertEqual(sorted(stopped["stopped"]), ["oled", "tft"])
+        self.assertEqual(stopped["restored"], ["oled"])
+
+        oled = self.client.get("/api/animation?device=oled").get_json()
+        self.assertEqual(oled["frame_count"], 5)
+        self.assertEqual(len(oled["program"]["steps"]), 1)
+        self.assertEqual(self.client.get("/api/devices/oled").get_json()["now_playing"],
+                         {"kind": "gif", "name": "before", "show": None})
+        self.assertNotIn("program", self.client.get("/api/animation?device=tft").get_json())
+
+        # The show no longer counts as playing anywhere.
+        self.assertEqual(self.client.get(f"/api/shows/{show['id']}").get_json()["playing_on"], [])
+
+    def test_show_over_show_returns_to_the_original_state(self):
+        self.quick_upload("oled", "before.gif")
+        lane = lambda effect: [{"device": "oled", "steps": [  # noqa: E731
+            {"type": "effect", "effect": effect, "seconds": 2}]}]
+        first = self.make_show(lane("rain"), name="A")
+        second = self.make_show(lane("snow"), name="B")
+
+        self.client.post(f"/api/shows/{first['id']}/play")
+        self.client.post(f"/api/shows/{second['id']}/play")
+        self.client.post(f"/api/shows/{second['id']}/stop")
+
+        self.assertEqual(self.client.get("/api/devices/oled").get_json()["now_playing"]["name"], "before")
+
+    def test_message_replaces_the_remembered_state(self):
+        self.quick_upload("oled", "before.gif")
+        show = self.make_show([{"device": "oled", "steps": [
+            {"type": "effect", "effect": "rain", "seconds": 2}]}])
+        self.client.post(f"/api/shows/{show['id']}/play")
+        self.client.post("/api/message?device=oled", json={"text": "new"})
+
+        stopped = self.client.post(f"/api/shows/{show['id']}/stop").get_json()
+        self.assertEqual(stopped["stopped"], [])
+        self.assertNotIn("program", self.client.get("/api/animation?device=oled").get_json())
+
+    def test_stop_falls_back_to_the_message_if_the_gif_is_gone(self):
+        self.quick_upload("oled", "before.gif")
+        gif_id = self.client.get("/api/gifs").get_json()["gifs"][0]["id"]
+        show = self.make_show([{"device": "oled", "steps": [
+            {"type": "effect", "effect": "rain", "seconds": 2}]}])
+        self.client.post(f"/api/shows/{show['id']}/play")
+        self.client.delete(f"/api/gifs/{gif_id}")
+
+        stopped = self.client.post(f"/api/shows/{show['id']}/stop").get_json()
+        self.assertEqual(stopped["restored"], [])
+        self.assertNotIn("program", self.client.get("/api/animation?device=oled").get_json())
+
     def test_effect_only_lane_has_no_frames_but_still_plays(self):
         show = self.make_show([{"device": "tft", "steps": [
             {"type": "effect", "effect": "static", "seconds": 4}]}])
@@ -174,6 +251,54 @@ class ApiTests(unittest.TestCase):
         info = self.client.get("/api/animation/jpeg?device=tft").get_json()
         self.assertEqual(info["frame_count"], 0)
         self.assertEqual(info["program"]["steps"][0]["effect"], 2)
+
+    def test_every_effect_is_accepted_and_numbered(self):
+        from partytime import config
+        steps = [{"type": "effect", "effect": name, "seconds": 1} for name in config.EFFECTS]
+        show = self.make_show([{"device": "tft", "steps": steps}])
+        self.assertEqual(self.client.post(f"/api/shows/{show['id']}/play").status_code, 200)
+
+        program = self.client.get("/api/animation/jpeg?device=tft").get_json()["program"]
+        self.assertEqual([s["effect"] for s in program["steps"]],
+                         list(config.EFFECTS.values()))
+        self.assertEqual(len(set(config.EFFECTS.values())), len(config.EFFECTS))
+
+    def test_text_steps_carry_their_text_and_blank_means_the_message(self):
+        self.client.post("/api/message?device=oled", json={"text": "Hi from oled"})
+        show = self.make_show([{"device": "oled", "steps": [
+            {"type": "text", "style": "marquee", "text": "PARTY TIME", "seconds": 5},
+            {"type": "text", "style": "flash", "text": "", "seconds": 3},
+            {"type": "text", "style": "wave", "text": "PARTY TIME", "seconds": 2}]}])
+        self.assertEqual(self.client.post(f"/api/shows/{show['id']}/play").status_code, 200)
+
+        program = self.client.get("/api/animation?device=oled").get_json()["program"]
+        self.assertEqual(program["texts"], ["PARTY TIME", "Hi from oled"])
+        self.assertEqual(
+            [(s["clip"], s["style"], s["text"]) for s in program["steps"]],
+            [(-3, 1, 0), (-3, 2, 1), (-3, 3, 0)],
+        )
+
+        playing = self.client.get("/api/devices/oled").get_json()["now_playing"]
+        self.assertEqual(playing["kind"], "text")
+        self.assertEqual(playing["name"], 'Marquee: "PARTY TIME"')
+
+    def test_too_many_different_texts_is_a_clear_error(self):
+        steps = [{"type": "text", "style": "flash", "text": f"word {i}", "seconds": 1}
+                 for i in range(9)]
+        show = self.make_show([{"device": "oled", "steps": steps}])
+        response = self.client.post(f"/api/shows/{show['id']}/play")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("texts", response.get_json()["error"])
+
+    def test_text_step_validation(self):
+        base = {"name": "x", "lanes": [{"device": "oled", "steps": []}]}
+        for step in (
+            {"type": "text", "style": "spin", "text": "a", "seconds": 1},
+            {"type": "text", "style": "wave", "text": 5, "seconds": 1},
+            {"type": "text", "style": "wave", "text": "x" * 101, "seconds": 1},
+        ):
+            base["lanes"][0]["steps"] = [step]
+            self.assertEqual(self.client.post("/api/shows", json=base).status_code, 400, step)
 
     def test_long_lanes_are_reduced_to_fit_the_frame_limit(self):
         a = self.upload("a.gif", frame_count=40)["id"]
@@ -231,6 +356,25 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.get(f"/api/shows/{show['id']}").get_json()["playing_on"],
                          ["oled"])
         self.assertIn("program", client.get("/api/animation?device=oled").get_json())
+
+    def test_gif_preview_works_with_a_relative_data_dir(self):
+        # The default DATA_DIR is "."; previews broke when paths stayed relative.
+        previous = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, previous)
+
+        client = create_app(data_dir="data").test_client()
+        entry = client.post(
+            "/api/gifs",
+            data={"gif": (io.BytesIO(make_gif()), "a.gif")},
+            content_type="multipart/form-data",
+        ).get_json()
+
+        response = client.get(f"/api/gifs/{entry['id']}/file")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/gif")
+        self.assertEqual(response.data[:3], b"GIF")
+        response.close()
 
     def test_shows_page_renders(self):
         self.assertEqual(self.client.get("/shows").status_code, 200)

@@ -30,10 +30,13 @@ unsigned long lastAnimationCheck = 0;
 
 // What is on screen. Message text is only drawn in text mode, so it never
 // overwrites a GIF or an effect.
-enum ScreenMode { SCREEN_TEXT, SCREEN_GIF, SCREEN_EFFECT };
+enum ScreenMode { SCREEN_TEXT, SCREEN_GIF, SCREEN_EFFECT, SCREEN_STEPTEXT };
 ScreenMode screenMode = SCREEN_TEXT;
 int shownFrame = -1;
 int shownEffect = TL_EFFECT_NONE;
+int shownStep = -1;   // timeline step an effect or text step belongs to
+int shownStyle = TL_STYLE_NONE;
+int shownText = -1;
 const unsigned long EFFECT_TICK_MS = 60;
 unsigned long lastEffectTick = 0;
 
@@ -240,6 +243,9 @@ void enterTextMode() {
   screenMode = SCREEN_TEXT;
   shownFrame = -1;
   shownEffect = TL_EFFECT_NONE;
+  shownStep = -1;
+  shownStyle = TL_STYLE_NONE;
+  shownText = -1;
   drawScreen();
 }
 
@@ -302,13 +308,413 @@ void tickStatic() {
   display.display();
 }
 
+// Everything below moves as a function of the step's elapsed time (ms since the
+// step began, from the show clock), so every display of a show matches. Only
+// rain, static, snow and confetti keep random per-device state.
+
+static const int EQ_BARS = 16;
+
+float eqLevel(int bar, float t) {
+  return (sinf(t * 0.004f * (1 + bar % 3) + bar * 1.7f) +
+          sinf(t * 0.0027f * (1 + bar % 4) + bar * 0.9f) + 2.0f) / 4.0f;
+}
+
+// Equalizer: segmented bars growing from the bottom, with a peak cap that
+// falls slowly (the highest level of the last half second, less a decay).
+void tickEqualizer(uint32_t t) {
+  display.clearDisplay();
+
+  for (int i = 0; i < EQ_BARS; i++) {
+    int x = i * 8;
+    int h = (int)(eqLevel(i, (float)t) * 60.0f) + 2;
+
+    for (int y = 0; y < h; y += 3) {
+      display.fillRect(x, SCREEN_HEIGHT - y - 2, 7, 2, SSD1306_WHITE);
+    }
+
+    float peak = 0;
+    for (int k = 0; k < 6; k++) {
+      float level = eqLevel(i, (float)t - k * 100.0f) - k * 0.05f;
+      if (level > peak) peak = level;
+    }
+    int ph = (int)(peak * 60.0f) + 4;
+    if (ph > h) display.fillRect(x, SCREEN_HEIGHT - ph - 1, 7, 1, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
+// Scanner: an 8 px head sweeping across the middle, back and forth every
+// 1600 ms, with a trail that thins out behind it.
+void tickScanner(uint32_t t) {
+  display.clearDisplay();
+
+  uint32_t phase = t % 1600;
+  bool forward = phase < 800;
+  int travel = forward ? phase : 1600 - phase;
+  int x = travel * (SCREEN_WIDTH - 8) / 800;
+  const int y = (SCREEN_HEIGHT - 8) / 2;
+
+  display.fillRect(x, y, 8, 8, SSD1306_WHITE);
+
+  for (int d = 1; d <= 28; d++) {
+    if (d % (1 + d / 7) != 0) continue;
+    int cx = forward ? x - d : x + 7 + d;
+    if (cx >= 0 && cx < SCREEN_WIDTH) display.drawFastVLine(cx, y, 8, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
+// Radar: a beam sweeping a circle every 3 s, with fading blips left behind.
+static const float RADAR_BLIP_ANGLE[5] = {0.7f, 1.9f, 3.3f, 4.4f, 5.6f};
+static const float RADAR_BLIP_RADIUS[5] = {20, 12, 25, 16, 22};
+
+void dottedLine(int x0, int y0, int x1, int y1, int stride) {
+  int steps = 30;
+  for (int i = 0; i <= steps; i += stride) {
+    display.drawPixel(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps, SSD1306_WHITE);
+  }
+}
+
+void tickRadar(uint32_t t) {
+  const int cx = SCREEN_WIDTH / 2, cy = SCREEN_HEIGHT / 2, r = 30;
+  const float TAU = 6.2831853f;
+
+  display.clearDisplay();
+  display.drawCircle(cx, cy, r, SSD1306_WHITE);
+  display.drawFastHLine(cx - r, cy, 2 * r + 1, SSD1306_WHITE);
+  display.drawFastVLine(cx, cy - r, 2 * r + 1, SSD1306_WHITE);
+
+  float angle = (float)(t % 3000) / 3000.0f * TAU;
+
+  for (int b = 0; b < 5; b++) {
+    float since = fmodf(angle - RADAR_BLIP_ANGLE[b] + TAU, TAU);
+    float age = since / TAU * 3000.0f;
+    if (age > 1200.0f) continue;
+
+    int bx = cx + (int)(RADAR_BLIP_RADIUS[b] * cosf(RADAR_BLIP_ANGLE[b]));
+    int by = cy + (int)(RADAR_BLIP_RADIUS[b] * sinf(RADAR_BLIP_ANGLE[b]));
+    int size = age < 500 ? 3 : (age < 900 ? 2 : 1);
+    display.fillRect(bx - size / 2, by - size / 2, size, size, SSD1306_WHITE);
+  }
+
+  for (int k = 4; k >= 1; k--) {
+    float a = angle - k * 0.12f;
+    dottedLine(cx, cy, cx + (int)(r * cosf(a)), cy + (int)(r * sinf(a)), k + 1);
+  }
+  display.drawLine(cx, cy, cx + (int)(r * cosf(angle)), cy + (int)(r * sinf(angle)), SSD1306_WHITE);
+
+  display.display();
+}
+
+// Test pattern: seven bars, each filled differently, over a grey ramp, with the
+// device's name in the middle. Static, so it is drawn once.
+static const uint8_t BAYER4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+
+bool barPixel(int bar, int x, int y) {
+  switch (bar) {
+    case 0: return true;
+    case 1: return !(x % 2 == 0 && y % 2 == 0);   // 3/4
+    case 2: return (x + y) % 2 == 0;              // checker
+    case 3: return x % 2 == 0 && y % 2 == 0;      // 1/4
+    case 4: return x % 2 == 0;                    // vertical stripes
+    case 5: return y % 2 == 0;                    // horizontal stripes
+    default: return false;
+  }
+}
+
+void drawTestPattern() {
+  const int left = 4, barW = 17, top = 3, barH = 42;
+
+  display.clearDisplay();
+
+  for (int bar = 0; bar < 7; bar++) {
+    for (int y = top; y < top + barH; y++) {
+      for (int x = left + bar * barW; x < left + (bar + 1) * barW; x++) {
+        if (barPixel(bar, x, y)) display.drawPixel(x, y, SSD1306_WHITE);
+      }
+    }
+  }
+
+  // A ramp from black to white under the bars.
+  for (int x = left; x < left + 7 * barW; x++) {
+    int level = (x - left) * 16 / (7 * barW);
+    for (int y = 48; y < 61; y++) {
+      if (level > BAYER4[(y % 4) * 4 + (x % 4)]) display.drawPixel(x, y, SSD1306_WHITE);
+    }
+  }
+
+  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+
+  int w = strlen(DEVICE_NAME) * 6 + 8;
+  if (w > SCREEN_WIDTH - 8) w = SCREEN_WIDTH - 8;
+  int x = (SCREEN_WIDTH - w) / 2;
+  display.fillRect(x, 25, w, 14, SSD1306_BLACK);
+  display.drawRect(x, 25, w, 14, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+  display.setCursor(x + 4, 28);
+  display.print(DEVICE_NAME);
+
+  display.display();
+}
+
+// Snow and confetti: particles falling and swaying.
+#define MAX_PARTICLES 30
+struct Particle {
+  float x, y, v, phase;
+};
+Particle particles[MAX_PARTICLES];
+int particleCount = 0;
+
+void startParticles(bool confetti) {
+  particleCount = confetti ? 20 : 30;
+
+  for (int i = 0; i < particleCount; i++) {
+    particles[i].x = esp_random() % SCREEN_WIDTH;
+    particles[i].y = esp_random() % SCREEN_HEIGHT;
+    particles[i].v = confetti ? 2.0f + (esp_random() % 200) / 100.0f
+                              : 0.8f + (esp_random() % 140) / 100.0f;
+    particles[i].phase = (esp_random() % 628) / 100.0f;
+  }
+}
+
+void tickParticles(bool confetti) {
+  display.clearDisplay();
+
+  for (int i = 0; i < particleCount; i++) {
+    Particle &p = particles[i];
+
+    p.y += p.v;
+    p.phase += confetti ? 0.3f : 0.15f;
+
+    if (p.y > SCREEN_HEIGHT) {
+      p.y = -3;
+      p.x = esp_random() % SCREEN_WIDTH;
+    }
+
+    int x = (int)(p.x + (confetti ? 6 : 3) * sinf(p.phase));
+    int y = (int)p.y;
+
+    if (confetti) {
+      // Tumbling: alternate between a 2x2 block and a flat 3x1 sliver.
+      if (((int)(p.phase * 2)) & 1) display.fillRect(x, y, 3, 1, SSD1306_WHITE);
+      else display.fillRect(x, y, 2, 2, SSD1306_WHITE);
+    } else {
+      int size = p.v > 1.6f ? 2 : 1;
+      display.fillRect(x, y, size, size, SSD1306_WHITE);
+    }
+  }
+
+  display.display();
+}
+
+// Position along a back-and-forth path, given the distance travelled so far.
+int bouncePos(uint32_t travelled, int range, uint32_t *bounces) {
+  if (range <= 0) {
+    *bounces = 0;
+    return 0;
+  }
+
+  uint32_t m = travelled % (2 * range);
+  *bounces = travelled / range;
+  return m <= (uint32_t)range ? (int)m : 2 * range - (int)m;
+}
+
+// Bounce: the device's name in a box, ricocheting off the edges. The box
+// inverts at every wall hit.
+void tickBounce(uint32_t t) {
+  int len = strlen(DEVICE_NAME);
+  int size = (len * 12 + 6 <= SCREEN_WIDTH) ? 2 : 1;
+  int w = len * 6 * size + 6;
+  if (w > SCREEN_WIDTH) w = SCREEN_WIDTH;
+  int h = 8 * size + 6;
+
+  uint32_t hitsX, hitsY;
+  int x = bouncePos(t * 40 / 1000, SCREEN_WIDTH - w, &hitsX);
+  int y = bouncePos(t * 25 / 1000, SCREEN_HEIGHT - h, &hitsY);
+  bool inverted = (hitsX + hitsY) & 1;
+
+  display.clearDisplay();
+
+  if (inverted) display.fillRect(x, y, w, h, SSD1306_WHITE);
+  else display.drawRect(x, y, w, h, SSD1306_WHITE);
+
+  display.setTextSize(size);
+  display.setTextWrap(false);
+  display.setTextColor(inverted ? SSD1306_BLACK : SSD1306_WHITE);
+  display.setCursor(x + 3, y + 3);
+  display.print(DEVICE_NAME);
+
+  display.display();
+}
+
+// ---- Text steps: a message of their own, in one of three styles --------------
+
+// Marquee: one big line scrolling right to left, repeated so it never runs out.
+void drawMarquee(const char *text, uint32_t t) {
+  int len = strlen(text);
+  if (len == 0) return;
+
+  const int charW = 18;
+  int textW = len * charW;
+  int period = textW + 3 * charW;
+  int offset = (int)((t * 60 / 1000) % period);
+
+  for (int copy = 0; copy < 2; copy++) {
+    int startX = copy * period - offset;
+    if (startX >= SCREEN_WIDTH || startX + textW <= 0) continue;
+
+    for (int i = 0; i < len; i++) {
+      int x = startX + i * charW;
+      if (x + charW <= 0 || x >= SCREEN_WIDTH) continue;
+      display.drawChar(x, (SCREEN_HEIGHT - 24) / 2, text[i], SSD1306_WHITE, SSD1306_BLACK, 3);
+    }
+  }
+}
+
+// Flash words: one word at a time, as big as fits, alternating inverted.
+void drawFlashWords(const char *text, uint32_t t) {
+  int len = strlen(text);
+
+  int wordCount = 0;
+  for (int i = 0; i < len; i++) {
+    if (text[i] != ' ' && (i == 0 || text[i - 1] == ' ')) wordCount++;
+  }
+  if (wordCount == 0) return;
+
+  uint32_t slot = t / 450;
+  int wanted = slot % wordCount;
+
+  // Find the wanted word.
+  int found = -1, start = 0, wordLen = 0;
+  for (int i = 0; i < len; i++) {
+    if (text[i] == ' ' || (i > 0 && text[i - 1] != ' ')) continue;
+    found++;
+    if (found == wanted) {
+      start = i;
+      while (start + wordLen < len && text[start + wordLen] != ' ') wordLen++;
+      break;
+    }
+  }
+  if (wordLen == 0) return;
+
+  int size = SCREEN_WIDTH / (6 * wordLen);
+  if (size > 8) size = 8;
+  if (size < 1) size = 1;
+
+  bool inverted = slot & 1;
+  uint16_t fg = inverted ? SSD1306_BLACK : SSD1306_WHITE;
+  uint16_t bg = inverted ? SSD1306_WHITE : SSD1306_BLACK;
+  if (inverted) display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+
+  int x = (SCREEN_WIDTH - wordLen * 6 * size) / 2;
+  int y = (SCREEN_HEIGHT - 8 * size) / 2;
+
+  for (int i = 0; i < wordLen; i++) {
+    display.drawChar(x + i * 6 * size, y, text[start + i], fg, bg, size);
+  }
+}
+
+#define WAVE_COLS 21
+#define WAVE_MAX_LINES 5
+
+// Split text into lines of up to WAVE_COLS characters, breaking at spaces
+// where possible. Returns the number of lines.
+int waveLayout(const char *text, int *starts, int *lens) {
+  int len = strlen(text), pos = 0, lines = 0;
+
+  while (pos < len && lines < WAVE_MAX_LINES) {
+    while (pos < len && text[pos] == ' ') pos++;
+    if (pos >= len) break;
+
+    int take = len - pos;
+    if (take > WAVE_COLS) {
+      take = WAVE_COLS;
+      for (int k = WAVE_COLS; k > 0; k--) {
+        if (text[pos + k] == ' ') {
+          take = k;
+          break;
+        }
+      }
+    }
+
+    int end = take;
+    while (end > 0 && text[pos + end - 1] == ' ') end--;
+
+    starts[lines] = pos;
+    lens[lines] = end;
+    lines++;
+    pos += take;
+  }
+
+  return lines;
+}
+
+// Wave: the text filling the screen, each letter bobbing on a sine wave.
+void drawWaveText(const char *text, uint32_t t) {
+  int starts[WAVE_MAX_LINES], lens[WAVE_MAX_LINES];
+  int lines = waveLayout(text, starts, lens);
+  int top = (SCREEN_HEIGHT - lines * 12) / 2 + 2;
+
+  for (int line = 0; line < lines; line++) {
+    int x0 = (SCREEN_WIDTH - lens[line] * 6) / 2;
+
+    for (int col = 0; col < lens[line]; col++) {
+      char c = text[starts[line] + col];
+      if (c == ' ') continue;
+
+      int dy = (int)roundf(2.0f * sinf(t * 0.008f + col * 0.6f + line * 0.8f));
+      display.drawChar(x0 + col * 6, top + line * 12 + dy, c, SSD1306_WHITE, SSD1306_BLACK, 1);
+    }
+  }
+}
+
+void tickText(uint32_t t) {
+  const char *text = (shownText >= 0 && shownText < timeline.textCount) ? timeline.texts[shownText] : "";
+
+  display.clearDisplay();
+
+  if (shownStyle == TL_STYLE_MARQUEE) drawMarquee(text, t);
+  else if (shownStyle == TL_STYLE_FLASH) drawFlashWords(text, t);
+  else if (shownStyle == TL_STYLE_WAVE) drawWaveText(text, t);
+
+  display.display();
+}
+
+// Set up an effect the moment its step begins.
+void startEffect(int effect) {
+  if (effect == TL_EFFECT_RAIN) startRain();
+  else if (effect == TL_EFFECT_SNOW) startParticles(false);
+  else if (effect == TL_EFFECT_CONFETTI) startParticles(true);
+  else if (effect == TL_EFFECT_TESTPATTERN) drawTestPattern();
+}
+
 void tickEffect() {
   unsigned long now = millis();
   if (now - lastEffectTick < EFFECT_TICK_MS) return;
   lastEffectTick = now;
 
-  if (shownEffect == TL_EFFECT_RAIN) tickRain();
-  else if (shownEffect == TL_EFFECT_STATIC) tickStatic();
+  uint32_t t = tlStepElapsed(timeline, clock_, now, shownStep);
+
+  if (screenMode == SCREEN_STEPTEXT) {
+    tickText(t);
+    return;
+  }
+
+  switch (shownEffect) {
+    case TL_EFFECT_RAIN: tickRain(); break;
+    case TL_EFFECT_STATIC: tickStatic(); break;
+    case TL_EFFECT_EQUALIZER: tickEqualizer(t); break;
+    case TL_EFFECT_SCANNER: tickScanner(t); break;
+    case TL_EFFECT_RADAR: tickRadar(t); break;
+    case TL_EFFECT_SNOW: tickParticles(false); break;
+    case TL_EFFECT_CONFETTI: tickParticles(true); break;
+    case TL_EFFECT_BOUNCE: tickBounce(t); break;
+    default: break;  // the test pattern is static
+  }
 }
 
 // ---- Playback ----------------------------------------------------------------
@@ -321,12 +727,29 @@ void drawTarget() {
   }
 
   if (target.kind == TL_EFFECT) {
+    shownStep = target.step;  // effects run on the step's own clock
+
     if (screenMode != SCREEN_EFFECT || shownEffect != target.effect) {
       screenMode = SCREEN_EFFECT;
       shownFrame = -1;
       shownEffect = target.effect;
+      shownStyle = TL_STYLE_NONE;
       lastEffectTick = 0;
-      if (shownEffect == TL_EFFECT_RAIN) startRain();
+      startEffect(shownEffect);
+    }
+    return;
+  }
+
+  if (target.kind == TL_TEXT) {
+    shownStep = target.step;
+    shownText = target.text;
+
+    if (screenMode != SCREEN_STEPTEXT || shownStyle != target.style) {
+      screenMode = SCREEN_STEPTEXT;
+      shownFrame = -1;
+      shownEffect = TL_EFFECT_NONE;
+      shownStyle = target.style;
+      lastEffectTick = 0;
     }
     return;
   }
@@ -337,6 +760,7 @@ void drawTarget() {
   screenMode = SCREEN_GIF;
   shownFrame = target.frame;
   shownEffect = TL_EFFECT_NONE;
+  shownStyle = TL_STYLE_NONE;
 }
 
 void playTimeline() {
@@ -374,7 +798,7 @@ void playTimeline() {
     lastFrameFetch = 0;
   }
 
-  if (screenMode == SCREEN_EFFECT) tickEffect();
+  if (screenMode == SCREEN_EFFECT || screenMode == SCREEN_STEPTEXT) tickEffect();
 
   // Keep the message dancing between GIF frames (GIFs can have long delays).
   if (screenMode == SCREEN_GIF) danceTick();

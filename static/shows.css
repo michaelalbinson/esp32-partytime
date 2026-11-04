@@ -158,5 +158,6 @@ button.icon { padding: 0.35rem 0.6rem; }
   color: #aab0bf;
 }
 .step select { flex: 1 1 10rem; min-width: 0; }
+.step .step-text { flex: 2 1 12rem; min-width: 0; }
 .step .loops { min-width: 4.5rem; color: #aab0bf; font-size: 0.8rem; }
 .lane-footer { margin-top: 0.5rem; }

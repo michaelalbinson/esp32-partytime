@@ -67,7 +67,23 @@ MAX_LANE_STEPS = 24
 # Effects the devices generate themselves, at their full native resolution.
 # The numbers are what the firmware receives; keep them in step with
 # TL_EFFECT_* in sketch/*/timeline.h.
-EFFECTS = {"rain": 1, "static": 2}
+EFFECTS = {
+    "rain": 1,
+    "static": 2,
+    "equalizer": 3,
+    "scanner": 4,
+    "radar": 5,
+    "testpattern": 6,
+    "snow": 7,
+    "confetti": 8,
+    "bounce": 9,
+}
+
+# Text steps show their own text in one of these styles, drawn by the device.
+# Keep in step with TL_STYLE_* in sketch/*/timeline.h.
+TEXT_STYLES = {"marquee": 1, "flash": 2, "wave": 3}
+MAX_TEXT_LENGTH = 100   # characters; devices keep plain ASCII only
+MAX_PROGRAM_TEXTS = 8   # distinct texts in one lane
 
 MAX_LANES = 8
 MIN_STEP_SECONDS = 0.1

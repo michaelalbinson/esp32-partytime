@@ -19,6 +19,8 @@ def empty_animation(version=0):
     A playing record also carries "frames" (1-bit frames, base64),
     "rgb332_frames", "frame_delays_ms" (one per frame, all clips back to back),
     "clips", "steps", "cycle_ms", "started_at" and "show_id" -- see program.py.
+    "resume" is set while a show plays: the library GIF ({"gif": id}) the device
+    was looping before the show, to go back to when the show stops.
     """
     return {
         "version": version,
@@ -27,9 +29,11 @@ def empty_animation(version=0):
         "frame_delays_ms": [],
         "clips": [],
         "steps": [],
+        "texts": [],
         "cycle_ms": 0,
         "started_at": 0,
         "show_id": None,
+        "resume": None,
     }
 
 

@@ -1,11 +1,23 @@
 "use strict";
 
-// Step choices besides GIFs. Values are what the server stores.
-const SPECIAL_STEPS = [
-  { value: "wait", label: "⏸ Wait (show the text message)", type: "wait" },
-  { value: "effect:rain", label: "✨ Digital rain", type: "effect", effect: "rain" },
-  { value: "effect:static", label: "✨ Static", type: "effect", effect: "static" },
+// Step choices besides GIFs. Values are "effect:<name>" and "text:<style>".
+const EFFECTS = [
+  ["rain", "Digital rain", "#2f9e5b"],
+  ["static", "Static", "#8a8f9c"],
+  ["equalizer", "Equalizer", "#3aa6a0"],
+  ["scanner", "Scanner", "#c0453d"],
+  ["radar", "Radar", "#3f8f3f"],
+  ["testpattern", "Test pattern", "#a557b5"],
+  ["snow", "Snowfall", "#9db8d9"],
+  ["confetti", "Confetti", "#d99a2b"],
+  ["bounce", "Bouncing logo", "#5a73d6"],
 ];
+const TEXT_STYLES = [
+  ["marquee", "Marquee (scrolling)"],
+  ["flash", "Flash words"],
+  ["wave", "Wavy text"],
+];
+const TEXT_COLOR = "#c58b2f";
 
 const state = {
   gifs: [],
@@ -26,6 +38,7 @@ function h(tag, attrs = {}, ...children) {
     else if (value !== false && value != null) el.setAttribute(key, value);
   }
   for (const child of children.flat()) {
+    if (child == null || child === false) continue;
     el.append(child instanceof Node ? child : document.createTextNode(child));
   }
   return el;
@@ -140,13 +153,21 @@ function newShow(device) {
 function stepValue(step) {
   if (step.type === "gif") return `gif:${step.gif}`;
   if (step.type === "effect") return `effect:${step.effect}`;
+  if (step.type === "text") return `text:${step.style}`;
   return "wait";
 }
 
 function applyStepValue(step, value) {
   delete step.gif;
   delete step.effect;
-  if (value.startsWith("gif:")) {
+  delete step.style;
+  if (!value.startsWith("text:")) delete step.text;
+
+  if (value.startsWith("text:")) {
+    step.type = "text";
+    step.style = value.slice(5);
+    step.text = step.text || "";
+  } else if (value.startsWith("gif:")) {
     step.type = "gif";
     step.gif = value.slice(4);
   } else if (value.startsWith("effect:")) {
@@ -161,7 +182,8 @@ function segmentStyle(step, total) {
   const width = total > 0 ? ((Number(step.seconds) || 0) / total) * 100 : 0;
   let background = "";
   if (step.type === "gif") background = `hsl(${gifHue(step.gif)} 55% 45%)`;
-  if (step.type === "effect") background = step.effect === "rain" ? "#2f9e5b" : "#8a8f9c";
+  if (step.type === "effect") background = (EFFECTS.find((e) => e[0] === step.effect) || [])[2] || "#8a8f9c";
+  if (step.type === "text") background = TEXT_COLOR;
   return `width:${width}%;${background ? `background:${background}` : ""}`;
 }
 
@@ -217,8 +239,13 @@ function stepOptions(step) {
     ? [h("option", { value: `gif:${step.gif}`, selected: true }, "(missing GIF)")]
     : [];
 
+  const current = stepValue(step);
   return [
-    ...SPECIAL_STEPS.map((s) => h("option", { value: s.value, selected: stepValue(step) === s.value }, s.label)),
+    h("option", { value: "wait", selected: current === "wait" }, "⏸ Wait (show the text message)"),
+    h("optgroup", { label: "Effects" },
+      ...EFFECTS.map(([id, label]) => h("option", { value: `effect:${id}`, selected: current === `effect:${id}` }, `✨ ${label}`))),
+    h("optgroup", { label: "Text" },
+      ...TEXT_STYLES.map(([id, label]) => h("option", { value: `text:${id}`, selected: current === `text:${id}` }, `💬 ${label}`))),
     h("optgroup", { label: "GIFs" }, ...gifGroup, ...missing),
   ];
 }
@@ -227,7 +254,7 @@ function renderStep(lane, step, index) {
   const gif = step.type === "gif" ? gifById(step.gif) : null;
   const thumb = gif
     ? h("img", { class: "thumb", src: `/api/gifs/${gif.id}/file`, alt: "" })
-    : h("span", { class: "thumb wait" }, step.type === "effect" ? "✨" : "⏸");
+    : h("span", { class: "thumb wait" }, { effect: "✨", text: "💬" }[step.type] || "⏸");
 
   const move = (delta) => {
     const target = index + delta;
@@ -245,6 +272,11 @@ function renderStep(lane, step, index) {
         renderEditor();
       },
     }, stepOptions(step)),
+    step.type === "text" ? h("input", {
+      type: "text", class: "step-text", maxlength: "100", value: step.text || "",
+      placeholder: "Text (blank = the display's message)", "aria-label": "Text",
+      oninput: (event) => { step.text = event.target.value; },
+    }) : null,
     h("input", {
       type: "number", min: "0.1", max: "3600", step: "0.1",
       value: step.seconds, "aria-label": "Seconds",
@@ -344,6 +376,10 @@ function payload() {
         const out = { type: step.type, seconds: step.seconds };
         if (step.type === "gif") out.gif = step.gif;
         if (step.type === "effect") out.effect = step.effect;
+        if (step.type === "text") {
+          out.style = step.style;
+          out.text = step.text || "";
+        }
         return out;
       }),
     })),
@@ -387,7 +423,11 @@ $("#stop-btn").addEventListener("click", () => run(async () => {
   const result = await api(`/api/shows/${state.show.id}/stop`, { method: "POST" });
   await loadShows();
   return result;
-}, (result) => (result.stopped.length ? `Stopped ${result.stopped.join(", ")}.` : "Nothing was playing.")));
+}, (result) => {
+  if (!result.stopped.length) return "Nothing was playing.";
+  const back = result.restored.length ? ` ${result.restored.join(", ")} went back to the GIF it was playing before.` : "";
+  return `Stopped ${result.stopped.join(", ")}.${back}`;
+}));
 
 $("#delete-btn").addEventListener("click", async () => {
   if (!state.show.id || !confirm(`Delete show "${state.show.name}"?`)) return;

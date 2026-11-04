@@ -58,7 +58,7 @@ def delete_show(show_id):
     if not services_.shows.get(show_id):
         return jsonify(error="Show not found"), 404
 
-    stop_show(services_.registry, show_id)
+    stop_show(services_.registry, services_.library, show_id)
     services_.shows.delete(show_id)
     return jsonify(id=show_id, deleted=True)
 
@@ -86,4 +86,5 @@ def stop(show_id):
     if not services_.shows.get(show_id):
         return jsonify(error="Show not found"), 404
 
-    return jsonify(stopped=stop_show(services_.registry, show_id))
+    stopped, restored = stop_show(services_.registry, services_.library, show_id)
+    return jsonify(stopped=stopped, restored=restored)
