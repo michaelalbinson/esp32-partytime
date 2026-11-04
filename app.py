@@ -26,11 +26,10 @@ JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))  # Retained for compatibilit
 # stored delays).
 DEFAULT_FRAME_MS = 120
 
-# Browsers treat GIF delays of 10 ms or less as "unspecified" and play them at
-# 100 ms. We use a shorter 50 ms floor because 100 ms looked choppy on the
-# devices.
+# Shortest frame delay we will use. GIF delays are in 10 ms units and many GIFs
+# specify 0, which browsers bump to 100 ms; that looked choppy on the devices,
+# so we only enforce this small floor instead.
 MIN_GIF_DELAY_MS = 10
-UNSPECIFIED_GIF_DELAY_MS = 50
 
 # The ESP32 RGB332 frame buffer can hold at most 144 * 192 pixels.
 ANIM_MAX_PIXELS = 144 * 192
@@ -121,16 +120,13 @@ def new_device(screen_type="ssd1306", last_seen=None):
 
 
 def gif_frame_delay_ms(frame):
-    """Return a GIF frame's display time in ms, following browser rules."""
+    """Return a GIF frame's display time in ms, with a small minimum."""
     try:
         delay = int(frame.info.get("duration", 0))
     except (TypeError, ValueError):
         delay = 0
 
-    if delay <= MIN_GIF_DELAY_MS:
-        return UNSPECIFIED_GIF_DELAY_MS
-
-    return delay
+    return max(delay, MIN_GIF_DELAY_MS)
 
 
 def frame_timing(anim, frame_count):
