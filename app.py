@@ -27,9 +27,10 @@ JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))  # Retained for compatibilit
 DEFAULT_FRAME_MS = 120
 
 # Browsers treat GIF delays of 10 ms or less as "unspecified" and play them at
-# 100 ms. Match that so animations look the same on the device as in a browser.
+# 100 ms. We use a shorter 50 ms floor because 100 ms looked choppy on the
+# devices.
 MIN_GIF_DELAY_MS = 10
-UNSPECIFIED_GIF_DELAY_MS = 100
+UNSPECIFIED_GIF_DELAY_MS = 50
 
 # The ESP32 RGB332 frame buffer can hold at most 144 * 192 pixels.
 ANIM_MAX_PIXELS = 144 * 192
