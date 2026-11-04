@@ -28,6 +28,10 @@ ANIM_MAX_PIXELS = 144 * 192
 SCREEN_WIDTH = 240
 SCREEN_HEIGHT = 320
 
+# SSD1306 OLED: 128x64, 1 bit per pixel.
+MONO_WIDTH = 128
+MONO_HEIGHT = 64
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper()),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -122,6 +126,26 @@ def get_animation(device_id):
         }
 
     return info["animation"]
+
+
+def rgb_to_mono_frame(rgb):
+    """
+    Convert an RGB image to a 128x64, 1-bit-per-pixel frame for SSD1306
+    devices: fit with aspect ratio preserved, centered on black, dithered.
+    Rows are packed MSB-first (what Adafruit's drawBitmap expects),
+    1024 bytes in total.
+    """
+    fitted = rgb.copy()
+    fitted.thumbnail((MONO_WIDTH, MONO_HEIGHT), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGB", (MONO_WIDTH, MONO_HEIGHT), (0, 0, 0))
+    canvas.paste(
+        fitted,
+        ((MONO_WIDTH - fitted.width) // 2, (MONO_HEIGHT - fitted.height) // 2),
+    )
+
+    # convert("1") applies Floyd-Steinberg dithering; white pixels are 1 bits.
+    return canvas.convert("L").convert("1").tobytes()
 
 
 @app.get("/")
@@ -265,6 +289,7 @@ def upload_animation():
                 output_height -= 1
 
         rgb332_frames = []
+        mono_frames = []
 
         for rgba in rgba_frames:
             cropped = rgba.crop(content_bbox)
@@ -295,6 +320,8 @@ def upload_animation():
 
             rgb332_frames.append(bytes(frame))
 
+            mono_frames.append(rgb_to_mono_frame(black_background.convert("RGB")))
+
     except Exception as error:
         logger.warning("GIF processing failed: %s", error)
         return jsonify(error="Could not read that GIF"), 400
@@ -303,6 +330,11 @@ def upload_animation():
     encoded_frames = [
         base64.b64encode(frame).decode("ascii")
         for frame in rgb332_frames
+    ]
+
+    encoded_mono_frames = [
+        base64.b64encode(frame).decode("ascii")
+        for frame in mono_frames
     ]
 
     x = (SCREEN_WIDTH - output_width) // 2
@@ -317,7 +349,7 @@ def upload_animation():
 
         devices[device_id]["animation"] = {
             "version": version,
-            "frames": [],
+            "frames": encoded_mono_frames,
             "color_frames": [],
             "jpeg_frames": [],
             "rgb332_frames": encoded_frames,
