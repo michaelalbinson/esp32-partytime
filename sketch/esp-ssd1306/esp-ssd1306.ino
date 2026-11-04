@@ -612,7 +612,75 @@ void tickBounce(uint32_t t) {
   display.display();
 }
 
+// DVD logo: an approximation of the classic screensaver logo (bold "DVD" over
+// an ellipse holding "VIDEO"), bouncing off the edges. It alternates between a
+// solid logo and an outline at every wall hit, which is how a hit shows on a
+// 1-bit display.
+#define DVD_W 42
+#define DVD_H 31
+
+// Filled ellipse inscribed in the w x h box at (x, y), by scanlines.
+void fillEllipse(int x, int y, int w, int h, uint16_t color) {
+  for (int r = 0; r < h; r++) {
+    float dy = ((r + 0.5f) - h / 2.0f) / (h / 2.0f);
+    float k = 1.0f - dy * dy;
+    if (k <= 0) continue;
+
+    int half = (int)roundf((w / 2.0f) * sqrtf(k));
+    if (half > 0) display.drawFastHLine(x + w / 2 - half, y + r, 2 * half, color);
+  }
+}
+
+void tickDvd(uint32_t t) {
+  uint32_t hitsX, hitsY;
+  int x = bouncePos(t * 35 / 1000, SCREEN_WIDTH - DVD_W, &hitsX);
+  int y = bouncePos(t * 22 / 1000, SCREEN_HEIGHT - DVD_H, &hitsY);
+  bool outline = (hitsX + hitsY) & 1;
+
+  display.clearDisplay();
+  display.setTextWrap(false);
+  display.setTextSize(2);
+
+  // "DVD": bold by drawing it twice a pixel apart; outlined by drawing white
+  // copies around a black one.
+  int tx = x + 3, ty = y + 1;
+  if (!outline) {
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(tx, ty);
+    display.print("DVD");
+    display.setCursor(tx + 1, ty);
+    display.print("DVD");
+  } else {
+    static const int8_t around[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+    display.setTextColor(SSD1306_WHITE);
+    for (int i = 0; i < 4; i++) {
+      display.setCursor(tx + around[i][0], ty + around[i][1]);
+      display.print("DVD");
+    }
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(tx, ty);
+    display.print("DVD");
+  }
+
+  int ellipseY = y + 18;
+  fillEllipse(x, ellipseY, DVD_W, 13, SSD1306_WHITE);
+  if (outline) fillEllipse(x + 1, ellipseY + 1, DVD_W - 2, 11, SSD1306_BLACK);
+
+  display.setTextSize(1);
+  display.setTextColor(outline ? SSD1306_WHITE : SSD1306_BLACK);
+  display.setCursor(x + (DVD_W - 29) / 2, ellipseY + 3);
+  display.print("VIDEO");
+
+  display.display();
+}
+
 // ---- Text steps: a message of their own, in one of three styles --------------
+
+// Only wave text keeps newlines (as line breaks); everywhere else they are
+// just whitespace.
+static inline bool isGap(char c) {
+  return c == ' ' || c == '\n';
+}
 
 // Marquee: one big line scrolling right to left, repeated so it never runs out.
 void drawMarquee(const char *text, uint32_t t) {
@@ -631,7 +699,8 @@ void drawMarquee(const char *text, uint32_t t) {
     for (int i = 0; i < len; i++) {
       int x = startX + i * charW;
       if (x + charW <= 0 || x >= SCREEN_WIDTH) continue;
-      display.drawChar(x, (SCREEN_HEIGHT - 24) / 2, text[i], SSD1306_WHITE, SSD1306_BLACK, 3);
+      char c = text[i] == '\n' ? ' ' : text[i];
+      display.drawChar(x, (SCREEN_HEIGHT - 24) / 2, c, SSD1306_WHITE, SSD1306_BLACK, 3);
     }
   }
 }
@@ -642,7 +711,7 @@ void drawFlashWords(const char *text, uint32_t t) {
 
   int wordCount = 0;
   for (int i = 0; i < len; i++) {
-    if (text[i] != ' ' && (i == 0 || text[i - 1] == ' ')) wordCount++;
+    if (!isGap(text[i]) && (i == 0 || isGap(text[i - 1]))) wordCount++;
   }
   if (wordCount == 0) return;
 
@@ -652,11 +721,11 @@ void drawFlashWords(const char *text, uint32_t t) {
   // Find the wanted word.
   int found = -1, start = 0, wordLen = 0;
   for (int i = 0; i < len; i++) {
-    if (text[i] == ' ' || (i > 0 && text[i - 1] != ' ')) continue;
+    if (isGap(text[i]) || (i > 0 && !isGap(text[i - 1]))) continue;
     found++;
     if (found == wanted) {
       start = i;
-      while (start + wordLen < len && text[start + wordLen] != ' ') wordLen++;
+      while (start + wordLen < len && !isGap(text[start + wordLen])) wordLen++;
       break;
     }
   }
@@ -683,32 +752,51 @@ void drawFlashWords(const char *text, uint32_t t) {
 #define WAVE_MAX_LINES 5
 
 // Split text into lines of up to WAVE_COLS characters, breaking at spaces
-// where possible. Returns the number of lines.
+// where possible. A newline always ends a line, and an empty line between
+// newlines is kept as a blank line (length 0). Returns the number of lines.
 int waveLayout(const char *text, int *starts, int *lens) {
   int len = strlen(text), pos = 0, lines = 0;
 
   while (pos < len && lines < WAVE_MAX_LINES) {
-    while (pos < len && text[pos] == ' ') pos++;
-    if (pos >= len) break;
+    // One paragraph: up to the next newline.
+    int paragraphEnd = pos;
+    while (paragraphEnd < len && text[paragraphEnd] != '\n') paragraphEnd++;
 
-    int take = len - pos;
-    if (take > WAVE_COLS) {
-      take = WAVE_COLS;
-      for (int k = WAVE_COLS; k > 0; k--) {
-        if (text[pos + k] == ' ') {
-          take = k;
-          break;
+    int linesBefore = lines;
+    int p = pos;
+
+    while (lines < WAVE_MAX_LINES) {
+      while (p < paragraphEnd && text[p] == ' ') p++;
+      if (p >= paragraphEnd) break;
+
+      int take = paragraphEnd - p;
+      if (take > WAVE_COLS) {
+        take = WAVE_COLS;
+        for (int k = WAVE_COLS; k > 0; k--) {
+          if (text[p + k] == ' ') {
+            take = k;
+            break;
+          }
         }
       }
+
+      int end = take;
+      while (end > 0 && text[p + end - 1] == ' ') end--;
+
+      starts[lines] = p;
+      lens[lines] = end;
+      lines++;
+      p += take;
     }
 
-    int end = take;
-    while (end > 0 && text[pos + end - 1] == ' ') end--;
+    // An empty (or all-space) paragraph is a blank line.
+    if (lines == linesBefore && lines < WAVE_MAX_LINES) {
+      starts[lines] = pos;
+      lens[lines] = 0;
+      lines++;
+    }
 
-    starts[lines] = pos;
-    lens[lines] = end;
-    lines++;
-    pos += take;
+    pos = paragraphEnd + 1;
   }
 
   return lines;
@@ -774,6 +862,7 @@ void tickEffect() {
     case TL_EFFECT_SNOW: tickParticles(false); break;
     case TL_EFFECT_CONFETTI: tickParticles(true); break;
     case TL_EFFECT_BOUNCE: tickBounce(t); break;
+    case TL_EFFECT_DVD: tickDvd(t); break;
     default: break;  // the test pattern is static
   }
 }

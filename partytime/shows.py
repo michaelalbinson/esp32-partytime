@@ -1,7 +1,8 @@
 """
 Shows: saved sequences of GIFs across displays.
 
-A show has one lane per display. A lane is an ordered list of steps, each a GIF
+A show has one lane per display (or one for "all displays", which covers every
+display without a lane of its own). A lane is an ordered list of steps, each a GIF
 shown for a number of seconds, a wait, an effect (digital rain, static, equalizer...), or text (marquee, flash words, wavy). Lanes start together and loop, so the
 same GIFs can play in sync on several displays, or staggered with waits so they
 chase from one display to the next.

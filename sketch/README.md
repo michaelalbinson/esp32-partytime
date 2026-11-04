@@ -95,7 +95,7 @@ The server now supports multiple ESP32 devices. Each device:
 
 Polling the server happens in a FreeRTOS task on core 0 (alongside the WiFi stack), so a slow or failing request can't stall drawing, which stays on core 1. The task never touches the display: it posts what it learns into small mailboxes (`netlink.h`) and the drawing loop picks it up between frames. On the ST7735 the task also preloads the frame cache (a one-pixel progress line grows along the top edge while it does). Frames that aren't cached, and every frame on the SSD1306 and 7219, are still downloaded by the drawing loop and can still hold it up.
 
-Effects (digital rain, static, equalizer, scanner, radar, test pattern, snow, confetti, bouncing logo) and the text styles (marquee, flash words, wavy) are drawn by each sketch itself, at that display's full resolution (240×320, 128×64, 32×8). They move by the show clock (`tlStepElapsed`), so every display of a show agrees on where they are.
+Effects (digital rain, static, equalizer, scanner, radar, test pattern, snow, confetti, bouncing name, DVD logo) and the text styles (marquee, flash words, wavy) are drawn by each sketch itself, at that display's full resolution (240×320, 128×64, 32×8). They move by the show clock (`tlStepElapsed`), so every display of a show agrees on where they are.
 
 ## Sketch Behavior
 

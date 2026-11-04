@@ -80,6 +80,12 @@ class CleanTextTests(unittest.TestCase):
     def test_keeps_plain_ascii_and_squashes_whitespace(self):
         self.assertEqual(clean_text("  HAPPY   party\n time "), "HAPPY party time")
 
+    def test_newlines_read_as_spaces_unless_kept_for_wavy_text(self):
+        text = "HAPPY\nBIRTHDAY\r\n\n  MIKE  "
+        self.assertEqual(clean_text(text), "HAPPY BIRTHDAY MIKE")
+        self.assertEqual(clean_text(text, keep_newlines=True), "HAPPY\nBIRTHDAY\n\nMIKE")
+        self.assertEqual(clean_text("\n\n a   b \n\n", keep_newlines=True), "a b")
+
     def test_replaces_non_ascii_and_truncates(self):
         self.assertEqual(clean_text("caf\u00e9 \U0001f389"), "caf? ?")
         self.assertEqual(len(clean_text("x" * 500)), 100)
@@ -263,6 +269,65 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(stopped["restored"], [])
         self.assertNotIn("program", self.client.get("/api/animation?device=oled").get_json())
 
+    def test_all_displays_lane_syncs_every_display(self):
+        gif = self.upload(frame_count=3, delay=100)["id"]
+        show = self.make_show([{"device": "*", "steps": [
+            {"type": "gif", "gif": gif, "seconds": 2},
+            {"type": "effect", "effect": "rain", "seconds": 1}]}])
+        result = self.client.post(f"/api/shows/{show['id']}/play").get_json()
+        self.assertEqual(sorted(l["device"] for l in result["lanes"]), ["oled", "tft"])
+
+        oled = self.client.get("/api/animation?device=oled").get_json()["program"]
+        tft = self.client.get("/api/animation/jpeg?device=tft").get_json()["program"]
+        self.assertEqual(oled["steps"], tft["steps"])
+        self.assertEqual(oled["cycle_ms"], 3000)
+
+        # Both started at the same instant, so they report (nearly) the same position.
+        self.assertLess(abs(oled["position_ms"] - tft["position_ms"]), 100)
+
+        # A display added later is picked up the next time the show plays.
+        self.client.get("/api/message?device=late&screen=ssd1306")
+        result = self.client.post(f"/api/shows/{show['id']}/play").get_json()
+        self.assertEqual(sorted(l["device"] for l in result["lanes"]), ["late", "oled", "tft"])
+
+        stopped = self.client.post(f"/api/shows/{show['id']}/stop").get_json()
+        self.assertEqual(sorted(stopped["stopped"]), ["late", "oled", "tft"])
+
+    def test_a_displays_own_lane_overrides_the_all_lane(self):
+        show = self.make_show([
+            {"device": "*", "steps": [{"type": "effect", "effect": "rain", "seconds": 2}]},
+            {"device": "tft", "steps": [{"type": "effect", "effect": "static", "seconds": 4}]},
+        ])
+        result = self.client.post(f"/api/shows/{show['id']}/play").get_json()
+        self.assertEqual(result["cycle_ms"], 4000)
+
+        steps = lambda dev, url: self.client.get(f"{url}?device={dev}").get_json()["program"]["steps"]  # noqa: E731
+        self.assertEqual(steps("oled", "/api/animation")[0]["effect"], 1)
+        self.assertEqual(steps("tft", "/api/animation/jpeg")[0]["effect"], 2)
+
+    def test_all_lane_blank_text_uses_each_displays_own_message(self):
+        self.client.post("/api/message?device=oled", json={"text": "oled says hi"})
+        self.client.post("/api/message?device=tft", json={"text": "tft says hi"})
+        show = self.make_show([{"device": "*", "steps": [
+            {"type": "text", "style": "marquee", "text": "", "seconds": 2}]}])
+        self.client.post(f"/api/shows/{show['id']}/play")
+
+        self.assertEqual(self.client.get("/api/animation?device=oled").get_json()["program"]["texts"], ["oled says hi"])
+        self.assertEqual(self.client.get("/api/animation?device=tft").get_json()["program"]["texts"], ["tft says hi"])
+
+    def test_all_lane_needs_a_display_and_is_unique(self):
+        empty = create_app(data_dir=tempfile.mkdtemp()).test_client()
+        shown = empty.post("/api/shows", json={"name": "x", "lanes": [{"device": "*", "steps": [
+            {"type": "wait", "seconds": 1}]}]}).get_json()
+        response = empty.post(f"/api/shows/{shown['id']}/play")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no displays", response.get_json()["error"])
+
+        step = {"type": "wait", "seconds": 1}
+        twice = {"name": "x", "lanes": [{"device": "*", "steps": [step]}, {"device": "*", "steps": [step]}]}
+        self.assertEqual(self.client.post("/api/shows", json=twice).status_code, 400)
+        self.assertEqual(self.client.post("/api/devices", json={"name": "*"}).status_code, 400)
+
     def test_effect_only_lane_has_no_frames_but_still_plays(self):
         show = self.make_show([{"device": "tft", "steps": [
             {"type": "effect", "effect": "static", "seconds": 4}]}])
@@ -301,6 +366,27 @@ class ApiTests(unittest.TestCase):
         playing = self.client.get("/api/devices/oled").get_json()["now_playing"]
         self.assertEqual(playing["kind"], "text")
         self.assertEqual(playing["name"], 'Marquee: "PARTY TIME"')
+
+    def test_only_wavy_text_keeps_its_line_breaks(self):
+        body = "LINE ONE\nLINE TWO"
+        show = self.make_show([{"device": "oled", "steps": [
+            {"type": "text", "style": "wave", "text": body, "seconds": 2},
+            {"type": "text", "style": "marquee", "text": body, "seconds": 2}]}])
+        self.client.post(f"/api/shows/{show['id']}/play")
+
+        program = self.client.get("/api/animation?device=oled").get_json()["program"]
+        self.assertEqual(program["texts"], ["LINE ONE\nLINE TWO", "LINE ONE LINE TWO"])
+
+        # A blank wavy step uses the display's message, line breaks included.
+        self.client.post("/api/message?device=tft", json={"text": "Top\nBottom"})
+        blank = self.make_show([{"device": "tft", "steps": [
+            {"type": "text", "style": "wave", "text": "", "seconds": 2}]}], name="Blank")
+        self.client.post(f"/api/shows/{blank['id']}/play")
+        self.assertEqual(
+            self.client.get("/api/animation?device=tft").get_json()["program"]["texts"],
+            ["Top\nBottom"])
+        playing = self.client.get("/api/devices/tft").get_json()["now_playing"]["name"]
+        self.assertEqual(playing, 'Wavy text: "Top / Bottom"')
 
     def test_too_many_different_texts_is_a_clear_error(self):
         steps = [{"type": "text", "style": "flash", "text": f"word {i}", "seconds": 1}

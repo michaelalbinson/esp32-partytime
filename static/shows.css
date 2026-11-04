@@ -159,5 +159,15 @@ button.icon { padding: 0.35rem 0.6rem; }
 }
 .step select { flex: 1 1 10rem; min-width: 0; }
 .step .step-text { flex: 2 1 12rem; min-width: 0; }
+.step textarea.step-text {
+  padding: 0.5rem;
+  border: 1px solid #454957;
+  border-radius: 6px;
+  background: #111318;
+  color: #e8eaf0;
+  font: inherit;
+  box-sizing: border-box;
+  resize: vertical;
+}
 .step .loops { min-width: 4.5rem; color: #aab0bf; font-size: 0.8rem; }
 .lane-footer { margin-top: 0.5rem; }

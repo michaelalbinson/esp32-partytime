@@ -33,13 +33,25 @@ class Text(namedtuple("Text", "style text")):
     """Step reference for text the device draws in a style (see TEXT_STYLES)."""
 
 
-def clean_text(text):
-    """Plain printable ASCII, single-spaced, within the length limit."""
+def clean_text(text, keep_newlines=False):
+    """
+    Plain printable ASCII within the length limit. Runs of whitespace become one
+    space. Newlines are kept as line breaks when keep_newlines is set (wavy
+    text lays itself out in lines) and read as spaces otherwise.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     ascii_text = "".join(
-        ch if " " <= ch <= "~" else ("?" if ord(ch) > 126 else " ")
+        ch if (" " <= ch <= "~" or ch == "\n") else ("?" if ord(ch) > 126 else " ")
         for ch in text
     )
-    return " ".join(ascii_text.split())[:config.MAX_TEXT_LENGTH]
+
+    if keep_newlines:
+        lines = [" ".join(line.split()) for line in ascii_text.split("\n")]
+        cleaned = "\n".join(lines).strip("\n")
+    else:
+        cleaned = " ".join(ascii_text.split())
+
+    return cleaned[:config.MAX_TEXT_LENGTH]
 
 
 class ProgramError(Exception):
@@ -167,7 +179,7 @@ def build_animation(steps, sources):
             step["clip"] = -2
             step["effect"] = config.EFFECTS[ref.name]
         elif isinstance(ref, Text):
-            text = clean_text(ref.text)
+            text = clean_text(ref.text, keep_newlines=(ref.style == "wave"))
             if text not in texts:
                 texts.append(text)
             if len(texts) > config.MAX_PROGRAM_TEXTS:

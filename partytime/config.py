@@ -77,6 +77,7 @@ EFFECTS = {
     "snow": 7,
     "confetti": 8,
     "bounce": 9,
+    "dvd": 10,
 }
 
 # Text steps show their own text in one of these styles, drawn by the device.
@@ -84,6 +85,9 @@ EFFECTS = {
 TEXT_STYLES = {"marquee": 1, "flash": 2, "wave": 3}
 MAX_TEXT_LENGTH = 100   # characters; devices keep plain ASCII only
 MAX_PROGRAM_TEXTS = 8   # distinct texts in one lane
+
+# A lane for this "display" plays on every display that has no lane of its own.
+ALL_DEVICES = "*"
 
 MAX_LANES = 8
 MIN_STEP_SECONDS = 0.1

@@ -10,7 +10,8 @@ const EFFECTS = [
   ["testpattern", "Test pattern", "#a557b5"],
   ["snow", "Snowfall", "#9db8d9"],
   ["confetti", "Confetti", "#d99a2b"],
-  ["bounce", "Bouncing logo", "#5a73d6"],
+  ["bounce", "Bouncing name", "#5a73d6"],
+  ["dvd", "DVD logo", "#7a5ad6"],
 ];
 const TEXT_STYLES = [
   ["marquee", "Marquee (scrolling)"],
@@ -18,6 +19,8 @@ const TEXT_STYLES = [
   ["wave", "Wavy text"],
 ];
 const TEXT_COLOR = "#c58b2f";
+
+const ALL_DEVICES = "*"; // a lane for every display without a lane of its own
 
 const state = {
   gifs: [],
@@ -222,9 +225,15 @@ function updateTotals() {
 
 function deviceOptions(selected, taken) {
   const names = state.devices.map((d) => d.name);
-  if (selected && !names.includes(selected)) names.push(selected);
+  if (selected && selected !== ALL_DEVICES && !names.includes(selected)) names.push(selected);
 
-  return names.map((name) => {
+  const all = h("option", {
+    value: ALL_DEVICES,
+    selected: selected === ALL_DEVICES,
+    disabled: taken.has(ALL_DEVICES) && selected !== ALL_DEVICES,
+  }, "All displays");
+
+  return [all, ...names.map((name) => {
     const device = state.devices.find((d) => d.name === name);
     const label = device ? `${name} (${device.screen_type})` : `${name} (missing)`;
     return h("option", {
@@ -232,7 +241,7 @@ function deviceOptions(selected, taken) {
       selected: name === selected,
       disabled: taken.has(name) && name !== selected,
     }, label);
-  });
+  })];
 }
 
 function stepOptions(step) {
@@ -251,6 +260,27 @@ function stepOptions(step) {
       ...TEXT_STYLES.map(([id, label]) => h("option", { value: `text:${id}`, selected: current === `text:${id}` }, `💬 ${label}`))),
     h("optgroup", { label: "Images" }, ...gifGroup, ...missing),
   ];
+}
+
+// Wavy text lays itself out in lines, so it gets a box that takes newlines; the
+// other styles are a single line (a newline reads as a space).
+function textBox(step) {
+  const common = {
+    class: "step-text", maxlength: "100",
+    placeholder: step.style === "wave"
+      ? "Text; Enter starts a new line (blank = the display's message)"
+      : "Text (blank = the display's message)",
+    "aria-label": "Text",
+    oninput: (event) => { step.text = event.target.value; },
+  };
+
+  if (step.style === "wave") {
+    const box = h("textarea", { ...common, rows: "2" });
+    box.value = step.text || "";
+    return box;
+  }
+
+  return h("input", { ...common, type: "text", value: (step.text || "").replace(/\n/g, " ") });
 }
 
 function renderStep(lane, step, index) {
@@ -275,11 +305,7 @@ function renderStep(lane, step, index) {
         renderEditor();
       },
     }, stepOptions(step)),
-    step.type === "text" ? h("input", {
-      type: "text", class: "step-text", maxlength: "100", value: step.text || "",
-      placeholder: "Text (blank = the display's message)", "aria-label": "Text",
-      oninput: (event) => { step.text = event.target.value; },
-    }) : null,
+    step.type === "text" ? textBox(step) : null,
     h("input", {
       type: "number", min: "0.1", max: "3600", step: "0.1",
       value: step.seconds, "aria-label": "Seconds",
@@ -312,6 +338,9 @@ function renderLane(lane, laneIndex) {
         onchange: (event) => { lane.device = event.target.value; renderEditor(); },
       }, deviceOptions(lane.device, taken)),
       h("span", { class: "muted lane-total" }),
+      lane.device === ALL_DEVICES
+        ? h("span", { class: "muted" }, "· plays in sync on every display without its own lane")
+        : null,
       h("span", { class: "spacer" }),
       h("button", {
         type: "button", class: "danger icon", title: "Remove lane",
@@ -343,7 +372,7 @@ function renderToolbar() {
   $("#show-name").value = state.show.name;
   $("#stop-btn").disabled = !(saved && saved.playing_on.length);
   $("#delete-btn").disabled = !saved;
-  $("#add-lane-btn").disabled = state.show.lanes.length >= state.devices.length;
+  $("#add-lane-btn").disabled = !nextFreeDevice();
 }
 
 function renderEditor() {
@@ -362,11 +391,18 @@ $("#show-select").addEventListener("change", (event) => {
   renderEditor();
 });
 
-$("#add-lane-btn").addEventListener("click", () => {
+// A display with no lane yet, or "all displays" if that is still free.
+function nextFreeDevice() {
   const taken = new Set(state.show.lanes.map((lane) => lane.device));
   const free = state.devices.find((device) => !taken.has(device.name));
-  if (!free) return;
-  state.show.lanes.push({ device: free.name, steps: [defaultStep()] });
+  if (free) return free.name;
+  return taken.has(ALL_DEVICES) ? null : ALL_DEVICES;
+}
+
+$("#add-lane-btn").addEventListener("click", () => {
+  const device = nextFreeDevice();
+  if (!device) return;
+  state.show.lanes.push({ device, steps: [defaultStep()] });
   renderEditor();
 });
 

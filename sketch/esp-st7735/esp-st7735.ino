@@ -1294,6 +1294,97 @@ void tickBounce() {
   bounceDrawn = true;
 }
 
+// ---- DVD logo: an approximation of the classic screensaver logo bouncing around,
+// ---- changing color whenever it hits a wall ----------------------------------
+
+#define DVD_W 100
+#define DVD_H 66
+#define DVD_TEXT_ROWS 40        // the italic "DVD" fills the top 40 rows
+#define DVD_VX 70.0f            // px per second
+#define DVD_VY 50.0f
+#define DVD_COLORS 8
+int dvdX = 0, dvdY = 0;
+int dvdColor = -1;              // palette index the canvas is drawn in
+bool dvdDrawn = false;
+
+void startDvd() {
+  dvdColor = -1;
+  dvdDrawn = false;
+  allocCanvas(DVD_W, DVD_H);
+}
+
+// Draw the logo into the canvas in one color: heavy italic "DVD" above an
+// ellipse with "VIDEO" cut out of it.
+void renderDvd(uint16_t color) {
+  canvas->fillScreen(0);
+  canvas->setTextWrap(false);
+  canvas->setTextSize(5);
+  canvas->setTextColor(color);
+
+  // Drawn twice, a pixel apart, for weight.
+  canvas->setCursor(2, 0);
+  canvas->print("DVD");
+  canvas->setCursor(3, 0);
+  canvas->print("DVD");
+
+  // Lean the letters: shift each row right by an amount that grows towards the
+  // top, working right to left so rows can be moved in place.
+  uint16_t *pixels = canvas->getBuffer();
+  for (int y = 0; y < DVD_TEXT_ROWS; y++) {
+    int shift = (DVD_TEXT_ROWS - 1 - y) / 8;
+    if (shift == 0) continue;
+
+    uint16_t *row = pixels + (size_t)y * DVD_W;
+    memmove(row + shift, row, (DVD_W - shift) * sizeof(uint16_t));
+    for (int x = 0; x < shift; x++) row[x] = 0;
+  }
+
+  // The ellipse underneath.
+  const int cx = DVD_W / 2, cy = 54, rx = 46, ry = 11;
+  for (int dy = -ry; dy <= ry; dy++) {
+    float k = (float)dy / ry;
+    int half = (int)(rx * sqrtf(1.0f - k * k));
+    canvas->drawFastHLine(cx - half, cy + dy, 2 * half + 1, color);
+  }
+
+  canvas->setTextSize(2);
+  canvas->setTextColor(0);
+  canvas->setCursor(cx - 29, cy - 7);
+  canvas->print("VIDEO");
+}
+
+void tickDvd() {
+  if (!canvas) return;
+
+  float t = (float)stepElapsed() / 1000.0f;
+  float spanX = SCREEN_WIDTH - DVD_W;
+  float spanY = SCREEN_HEIGHT - DVD_H;
+  float distX = t * DVD_VX;
+  float distY = t * DVD_VY;
+
+  int x = (int)triangleWave(distX, spanX);
+  int y = (int)triangleWave(distY, spanY);
+
+  // One color change per wall hit, counted from the same time function that
+  // places the logo, so every display agrees.
+  long hits = (long)(distX / spanX) + (long)(distY / spanY);
+  int color = (int)(hits % DVD_COLORS);
+
+  if (color != dvdColor) {
+    dvdColor = color;
+    renderDvd(hsv565(color * (360 / DVD_COLORS) + 10, 255, 255));
+  }
+
+  if (dvdDrawn) {
+    eraseOldRect(dvdX, dvdY, x, y, DVD_W, DVD_H);
+  }
+
+  blitCanvas(x, y);
+  dvdX = x;
+  dvdY = y;
+  dvdDrawn = true;
+}
+
 // ---- Effect dispatch -------------------------------------------------------
 
 // Set up an effect on a freshly cleared screen.
@@ -1306,6 +1397,7 @@ void startEffect(int effect) {
     case TL_EFFECT_SNOW: startFlakes(false); break;
     case TL_EFFECT_CONFETTI: startFlakes(true); break;
     case TL_EFFECT_BOUNCE: startBounce(); break;
+    case TL_EFFECT_DVD: startDvd(); break;
     default: break;  // static and scanner need no setup
   }
 }
@@ -1324,6 +1416,7 @@ void tickEffect() {
     case TL_EFFECT_SNOW:
     case TL_EFFECT_CONFETTI: tickFlakes(); break;
     case TL_EFFECT_BOUNCE: tickBounce(); break;
+    case TL_EFFECT_DVD: tickDvd(); break;
     default: break;  // the test pattern is drawn once
   }
 }
@@ -1343,11 +1436,17 @@ int waveLineStart[WAVE_MAX_LINES];
 int waveLineLen[WAVE_MAX_LINES];
 int waveLines = 0;
 
+// Word separators. Only wavy text keeps its line breaks; anywhere else a
+// newline is just a space.
+bool isBlank(char c) {
+  return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
 int wordCount(const char *text) {
   int count = 0;
   bool inWord = false;
   for (const char *p = text; *p; p++) {
-    if (*p == ' ') inWord = false;
+    if (isBlank(*p)) inWord = false;
     else if (!inWord) { inWord = true; count++; }
   }
   return count;
@@ -1360,7 +1459,7 @@ int nthWord(const char *text, int n, char *out, int outSize) {
   int len = 0;
 
   for (const char *p = text; *p; p++) {
-    if (*p == ' ') {
+    if (isBlank(*p)) {
       if (inWord && count == n) break;
       inWord = false;
     } else {
@@ -1373,39 +1472,61 @@ int nthWord(const char *text, int n, char *out, int outSize) {
   return len;
 }
 
-// Break the text into lines of at most WAVE_COLS chars, at spaces if possible.
+// Break the text into lines. A newline always ends a line (and a blank line
+// keeps its height); lines longer than WAVE_COLS chars wrap at spaces if
+// possible. Spaces at the ends of lines are dropped.
 void layoutWave(const char *text) {
   int len = strlen(text);
   int i = 0;
   waveLines = 0;
 
   while (i < len && waveLines < WAVE_MAX_LINES) {
-    while (i < len && text[i] == ' ') i++;
-    if (i >= len) break;
+    int end = i;  // this paragraph runs to the next newline
+    while (end < len && text[end] != '\n') end++;
 
-    int lineLen;
-    int next;
+    int p = i;
+    bool any = false;
 
-    if (len - i <= WAVE_COLS) {
-      lineLen = len - i;
-      next = len;
-    } else {
-      int j = i + WAVE_COLS;
-      while (j > i && text[j] != ' ') j--;
+    while (p < end && waveLines < WAVE_MAX_LINES) {
+      while (p < end && text[p] == ' ') p++;
+      if (p >= end) break;
 
-      if (j > i) {
-        lineLen = j - i;
-        next = j + 1;
+      int lineLen;
+      int next;
+
+      if (end - p <= WAVE_COLS) {
+        lineLen = end - p;
+        next = end;
       } else {
-        lineLen = WAVE_COLS;
-        next = i + WAVE_COLS;
+        int j = p + WAVE_COLS;
+        while (j > p && text[j] != ' ') j--;
+
+        if (j > p) {
+          lineLen = j - p;
+          next = j + 1;
+        } else {
+          lineLen = WAVE_COLS;
+          next = p + WAVE_COLS;
+        }
       }
+
+      while (lineLen > 0 && text[p + lineLen - 1] == ' ') lineLen--;
+
+      waveLineStart[waveLines] = p;
+      waveLineLen[waveLines] = lineLen;
+      waveLines++;
+      any = true;
+      p = next;
     }
 
-    waveLineStart[waveLines] = i;
-    waveLineLen[waveLines] = lineLen;
-    waveLines++;
-    i = next;
+    if (!any && waveLines < WAVE_MAX_LINES) {
+      // An empty paragraph is a blank line.
+      waveLineStart[waveLines] = i;
+      waveLineLen[waveLines] = 0;
+      waveLines++;
+    }
+
+    i = end + 1;
   }
 }
 
@@ -1438,7 +1559,8 @@ void tickMarquee(const char *text) {
     for (int i = 0; i < len; i++) {
       int x = base + i * charW;
       if (x + charW <= 0 || x >= SCREEN_WIDTH) continue;
-      canvas->drawChar(x, 0, text[i], color, 0, MARQUEE_SIZE);
+      char ch = isBlank(text[i]) ? ' ' : text[i];
+      canvas->drawChar(x, 0, ch, color, 0, MARQUEE_SIZE);
     }
   }
 

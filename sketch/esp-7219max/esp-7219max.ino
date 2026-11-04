@@ -283,6 +283,7 @@ float tri(float x) {
 
 // Fetch a character's column bytes; returns its width in columns.
 uint8_t glyph(char c, uint8_t *buf) {
+  if ((uint8_t)c < ' ' || c == 127) c = ' ';  // never draw control characters
   uint8_t w = matrix.getChar((uint8_t)c, 8, buf);
   if (w == 0 && c != '?') w = matrix.getChar('?', 8, buf);
   if (w == 0) {
@@ -302,14 +303,15 @@ int textWidth(const char *s, int len) {
   return width;
 }
 
-// Draw one character with its top-left at (x, y); returns its width.
-int drawGlyph(char c, int x, int y) {
+// Draw one character with its top-left at (x, y); returns its width. With
+// on = false it clears the character's pixels instead.
+int drawGlyph(char c, int x, int y, bool on = true) {
   uint8_t buf[8];
   uint8_t w = glyph(c, buf);
 
   for (int i = 0; i < w; i++) {
     for (int r = 0; r < 8; r++) {
-      if ((buf[i] >> r) & 1) px(x + i, y + r);
+      if ((buf[i] >> r) & 1) px(x + i, y + r, on);
     }
   }
   return w;
@@ -466,6 +468,49 @@ void tickBounce(uint32_t t) {
   fbFlush();
 }
 
+// DVD logo: the letters "DVD" bounce off the edges of the matrix. It shifts a
+// row at each top/bottom hit and, for 150 ms after any hit, is drawn inverted
+// (a lit block with the letters cut out) so each hit is visible. Position and
+// hits are functions of t, so every display of a show agrees.
+#define DVD_COLS_PER_S 10.0f
+#define DVD_ROWS_PER_S 1.5f
+#define DVD_HIT_FLASH_MS 150
+
+void tickDvd(uint32_t t) {
+  const char *logo = "DVD";
+  int width = textWidth(logo, 3);
+  int spanX = RAIN_COLS - width;
+  if (spanX < 1) spanX = 1;
+
+  float distanceX = t * DVD_COLS_PER_S / 1000.0f;
+  float distanceY = t * DVD_ROWS_PER_S / 1000.0f;
+
+  int x = (int)roundf(spanX * tri(distanceX / (2.0f * spanX)));
+  int y = (int)roundf(tri(distanceY / 2.0f));  // 0 or 1
+
+  int hitsX = (int)(distanceX / spanX);
+  int hitsY = (int)distanceY;
+  float msSinceX = (distanceX - hitsX * spanX) * 1000.0f / DVD_COLS_PER_S;
+  float msSinceY = (distanceY - hitsY) * 1000.0f / DVD_ROWS_PER_S;
+  bool flash = (hitsX > 0 && msSinceX < DVD_HIT_FLASH_MS) ||
+               (hitsY > 0 && msSinceY < DVD_HIT_FLASH_MS);
+
+  fbClear();
+
+  if (flash) {
+    for (int c = x - 1; c <= x + width; c++) {
+      for (int r = y; r < y + 8; r++) px(c, r);
+    }
+  }
+
+  int gx = x;
+  for (int i = 0; i < 3; i++) {
+    gx += drawGlyph(logo[i], gx, y, !flash) + 1;
+  }
+
+  fbFlush();
+}
+
 void tickEffect() {
   unsigned long now = millis();
   bool slow = shownEffect == TL_EFFECT_RAIN || shownEffect == TL_EFFECT_STATIC;
@@ -484,6 +529,7 @@ void tickEffect() {
     case TL_EFFECT_SNOW: tickFlakes(false); break;
     case TL_EFFECT_CONFETTI: tickFlakes(true); break;
     case TL_EFFECT_BOUNCE: tickBounce(t); break;
+    case TL_EFFECT_DVD: tickDvd(t); break;
   }
 }
 
@@ -548,6 +594,27 @@ void drawFlashWords(const char *s, uint32_t t) {
   }
 }
 
+// Copy a step's text into out (TL_TEXT_LEN bytes) with every control character,
+// including newlines, as a space, runs of spaces collapsed, and no leading or
+// trailing space.
+void cleanText(const char *in, char *out) {
+  int n = 0;
+  bool pendingSpace = false;
+
+  for (int i = 0; in[i] && n < TL_TEXT_LEN - 1; i++) {
+    char c = in[i];
+    if ((uint8_t)c < ' ' || c == ' ' || c == 127) {
+      pendingSpace = n > 0;
+      continue;
+    }
+    if (pendingSpace && n < TL_TEXT_LEN - 2) out[n++] = ' ';
+    pendingSpace = false;
+    out[n++] = c;
+  }
+
+  out[n] = '\0';
+}
+
 void tickText() {
   unsigned long now = millis();
   if (now - lastTextTick < TEXT_TICK_MS) return;
@@ -555,7 +622,10 @@ void tickText() {
 
   if (shownText < 0 || shownText >= timeline.textCount) return;
 
-  const char *s = timeline.texts[shownText];
+  // The matrix has one line: line breaks (Wavy text can carry them) and any
+  // other control characters read as spaces, in runs of one.
+  char s[TL_TEXT_LEN];
+  cleanText(timeline.texts[shownText], s);
   uint32_t t = tlStepElapsed(timeline, clock_, now, shownStep);
 
   fbClear();

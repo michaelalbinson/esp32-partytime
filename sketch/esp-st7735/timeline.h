@@ -39,6 +39,7 @@
 #define TL_EFFECT_SNOW 7
 #define TL_EFFECT_CONFETTI 8
 #define TL_EFFECT_BOUNCE 9  // the device's name bouncing around, DVD-style
+#define TL_EFFECT_DVD 10    // the DVD logo bouncing around, changing color on each hit
 
 // Keep in step with TEXT_STYLES in partytime/config.py.
 #define TL_STYLE_NONE 0

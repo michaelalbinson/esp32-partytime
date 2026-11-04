@@ -2,6 +2,7 @@
 
 from flask import Blueprint, jsonify, request
 
+from ..config import ALL_DEVICES
 from ..playback import now_playing
 from ..registry import new_device
 from ..services import services
@@ -77,6 +78,8 @@ def create_device():
     name = name.strip()
     if not name:
         return jsonify(error="name cannot be empty"), 400
+    if name == ALL_DEVICES:
+        return jsonify(error=f'"{ALL_DEVICES}" is reserved for "all displays"'), 400
 
     with registry.lock:
         if name in registry.devices:

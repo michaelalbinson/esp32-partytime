@@ -249,9 +249,12 @@ A show has one **lane per display**. A lane is an ordered list of steps, played 
   | `radar` | a rotating radar sweep with blips |
   | `testpattern` | color bars (patterns on mono displays) |
   | `snow`, `confetti` | falling flakes / colored bits |
-  | `bounce` | the device name bouncing around like a DVD logo |
+  | `bounce` | the device's name in a box, bouncing around the screen |
+  | `dvd` | a DVD-style logo bouncing around, changing color on every wall hit (approximate artwork, not the real logo) |
 
-- **Text**: text the device draws in a `style`: `marquee` (scrolling), `flash` (one word at a time, as big as fits) or `wave` (the text filling the screen, each letter bobbing). Up to 100 plain-ASCII characters; anything else becomes `?`. Leave `text` blank to use the display's own message as it is when the show starts, and a lane can use up to 8 different texts.
+- **Text**: text the device draws in a `style`: `marquee` (scrolling), `flash` (one word at a time, as big as fits) or `wave` (the text filling the screen, each letter bobbing). Up to 100 plain-ASCII characters; anything else becomes `?`. Only `wave` keeps line breaks (`\n`, entered with Enter in the editor): it starts a new line, and a blank line leaves a gap. Every other style, and the 7219's one-line display, reads a line break as a space. Leave `text` blank to use the display's own message as it is when the show starts, and a lane can use up to 8 different texts.
+
+A lane's display can be **All displays** (`"device": "*"`): a lane that plays in sync on every display that has no lane of its own in the show. It is the quickest way to a synced show. Displays are counted when you press Play, so one added later joins the next time the show plays, and any display with its own lane keeps that lane. Only one all-displays lane is allowed. Text steps left blank show each display's own message.
 
 All lanes start together and share one cycle (the longest lane). Shorter lanes show their text for the rest. Use waits to stagger a GIF from one display to the next. Devices are told how far into the cycle the show is each time they poll, so displays stay in step to within a poll's network jitter. Sending a message to a display takes it out of the show.
 

@@ -3,7 +3,7 @@
 import logging
 import time
 
-from .config import EFFECTS, TEXT_STYLES
+from .config import ALL_DEVICES, EFFECTS, TEXT_STYLES
 from .media.image import ImageError
 from .program import WAIT, Effect, ProgramError, Text, build_animation
 from .protocol import cycle_position_ms
@@ -91,18 +91,41 @@ def lane_steps(lane, message=""):
     ]
 
 
+def expand_lanes(show, device_names):
+    """
+    The (device, lane) pairs a show plays. A lane for all displays covers every
+    display that has no lane of its own in the show, as they are registered now.
+    """
+    own = {lane["device"] for lane in show["lanes"] if lane["device"] != ALL_DEVICES}
+
+    pairs = []
+    for lane in show["lanes"]:
+        if lane["device"] == ALL_DEVICES:
+            pairs.extend((name, lane) for name in device_names if name not in own)
+        else:
+            pairs.append((lane["device"], lane))
+
+    return pairs
+
+
 def play_show(registry, library, show):
     """
     Render every lane of a show and start them together. Nothing changes on
     any device unless every lane renders. Raises PlaybackError.
     """
     with registry.lock:
-        missing = [
-            lane["device"] for lane in show["lanes"]
-            if lane["device"] not in registry.devices
-        ]
+        device_names = list(registry.devices)
+
+    missing = [
+        lane["device"] for lane in show["lanes"]
+        if lane["device"] != ALL_DEVICES and lane["device"] not in device_names
+    ]
     if missing:
         raise PlaybackError("Unknown display: " + ", ".join(missing), status=404)
+
+    pairs = expand_lanes(show, device_names)
+    if not pairs:
+        raise PlaybackError("There are no displays to play this show on yet")
 
     sources = {}
     try:
@@ -116,20 +139,25 @@ def play_show(registry, library, show):
 
     with registry.lock:
         messages = {
-            lane["device"]: registry.devices[lane["device"]]
-            .get("message", {}).get("text", "")
-            for lane in show["lanes"]
+            device: registry.devices.get(device, {}).get("message", {}).get("text", "")
+            for device, _ in pairs
         }
 
+    # Displays given the same steps share one render (frames are stored for
+    # every display type, so only text left blank can differ between them).
+    renders = {}
     animations = {}
     notes = {}
     try:
-        for lane in show["lanes"]:
-            animations[lane["device"]], notes[lane["device"]] = build_animation(
-                lane_steps(lane, messages[lane["device"]]), sources
-            )
+        for device, lane in pairs:
+            steps = lane_steps(lane, messages[device])
+            key = tuple(steps)
+            if key not in renders:
+                renders[key] = build_animation(steps, sources)
+            animations[device], notes[device] = renders[key]
     except ProgramError as error:
-        raise PlaybackError(f'{lane["device"]}: {error}') from error
+        label = "All displays" if lane["device"] == ALL_DEVICES else lane["device"]
+        raise PlaybackError(f"{label}: {error}") from error
 
     # Every lane runs for the length of the longest, so lanes stay in step
     # however their steps add up; a shorter lane idles at the end.
@@ -173,7 +201,8 @@ EFFECT_LABELS = {
     "testpattern": "Test pattern",
     "snow": "Snowfall",
     "confetti": "Confetti",
-    "bounce": "Bouncing logo",
+    "bounce": "Bouncing name",
+    "dvd": "DVD logo",
 }
 STYLE_NAMES = {code: name for name, code in TEXT_STYLES.items()}
 STYLE_LABELS = {"marquee": "Marquee", "flash": "Flash words", "wave": "Wavy text"}
@@ -208,6 +237,7 @@ def now_playing(anim, library, shows, now=None):
         style = STYLE_NAMES.get(step.get("style"), "text")
         texts = anim.get("texts", [])
         text = texts[step["text"]] if 0 <= step.get("text", -1) < len(texts) else ""
+        text = text.replace("\n", " / ")
         result.update(kind="text", name=f'{STYLE_LABELS.get(style, style)}: "{text}"')
     elif step and step["clip"] == -2:
         effect = EFFECT_NAMES.get(step.get("effect"), "effect")
