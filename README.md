@@ -328,7 +328,7 @@ Health check endpoint for monitoring.
 
 GIFs are stored once in the library. When a show plays, each lane's GIFs are rendered for that display:
 1. Each frame is converted to RGBA and composited onto black, cropped to the visible content
-2. **Color (RGB332)**: scaled to fit 240×320 within a per-frame pixel budget, so the whole lane fits the ST7735's RAM cache
+2. **Color (RGB332)**: scaled to fit 240×320 within a per-frame pixel budget, so the whole lane fits the ST7735's RAM cache. The ST7735 then draws each frame at the largest whole-number scale that fits the screen (nearest neighbour), centered, so small frames still fill it
 3. **Monochrome**: 1-bit, dithered, packed MSB first (128×64), with the top 16 rows left black for the dancing text
 4. At most `MAX_FRAMES` frames are read from each GIF
 

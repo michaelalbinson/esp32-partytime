@@ -488,42 +488,83 @@ void refreshAnimation() {
 
 // ---- Drawing ---------------------------------------------------------------
 
-// Convert a frame and draw it in RGB565 strips.
+// RGB332 -> RGB565, built once. Red/green/blue are widened by repeating their
+// top bits so full intensity stays full.
+uint16_t rgb332Lut[256];
+
+void initColorLut() {
+  for (int c = 0; c < 256; c++) {
+    uint8_t r3 = (c >> 5) & 0x07;
+    uint8_t g3 = (c >> 2) & 0x07;
+    uint8_t b2 = c & 0x03;
+
+    uint8_t r5 = (r3 << 2) | (r3 >> 1);
+    uint8_t g6 = (g3 << 3) | g3;
+    uint8_t b5 = (b2 << 3) | (b2 << 1) | (b2 >> 1);
+
+    rgb332Lut[c] = ((uint16_t)r5 << 11) | ((uint16_t)g6 << 5) | b5;
+  }
+}
+
+// The server shrinks frames so a whole show fits the RAM cache, so they are
+// often small. Draw each at the largest whole-number scale that fits the
+// screen (nearest neighbour: no extra RAM, just more pixels over SPI).
+#define MAX_FRAME_SCALE 8
+
+int clipScale(const TlClip &clip) {
+  int scale = min(SCREEN_WIDTH / (int)clip.width, SCREEN_HEIGHT / (int)clip.height);
+  if (scale < 1) scale = 1;
+  if (scale > MAX_FRAME_SCALE) scale = MAX_FRAME_SCALE;
+  return scale;
+}
+
+// Convert a frame, scale it up and draw it centered, in RGB565 strips.
 bool drawFrame(const uint8_t *src, const TlClip &clip) {
-  for (int row = 0; row < clip.height; row += STRIP_ROWS) {
+  int scale = clipScale(clip);
+  int scaledWidth = (int)clip.width * scale;
+  int scaledHeight = (int)clip.height * scale;
+  int originX = (SCREEN_WIDTH - scaledWidth) / 2;
+  int originY = (SCREEN_HEIGHT - scaledHeight) / 2;
+
+  for (int row = 0; row < scaledHeight; row += STRIP_ROWS) {
     int rows = STRIP_ROWS;
 
-    if (row + rows > clip.height) {
-      rows = clip.height - row;
+    if (row + rows > scaledHeight) {
+      rows = scaledHeight - row;
     }
 
-    size_t stripPixels = (size_t)clip.width * (size_t)rows;
+    size_t stripPixels = (size_t)scaledWidth * (size_t)rows;
 
     if (stripPixels > MAX_STRIP_PIXELS) {
       Serial.println("Strip exceeds RGB565 buffer");
       return false;
     }
 
-    size_t sourceOffset = (size_t)row * (size_t)clip.width;
+    int lastSourceRow = -1;
 
-    for (size_t i = 0; i < stripPixels; i++) {
-      uint8_t c = src[sourceOffset + i];
+    for (int r = 0; r < rows; r++) {
+      int sourceRow = (row + r) / scale;
+      uint16_t *out = pixelBuffer + (size_t)r * scaledWidth;
 
-      uint8_t r3 = (c >> 5) & 0x07;
-      uint8_t g3 = (c >> 2) & 0x07;
-      uint8_t b2 = c & 0x03;
+      if (sourceRow == lastSourceRow) {
+        // A scaled-up row repeats the one above it.
+        memcpy(out, out - scaledWidth, (size_t)scaledWidth * sizeof(uint16_t));
+        continue;
+      }
 
-      uint8_t r5 = (r3 << 2) | (r3 >> 1);
-      uint8_t g6 = (g3 << 3) | g3;
-      uint8_t b5 = (b2 << 3) | (b2 << 1) | (b2 >> 1);
+      lastSourceRow = sourceRow;
+      const uint8_t *line = src + (size_t)sourceRow * clip.width;
 
-      pixelBuffer[i] = ((uint16_t)r5 << 11) |
-                       ((uint16_t)g6 << 5) |
-                       b5;
+      for (int x = 0; x < clip.width; x++) {
+        uint16_t color = rgb332Lut[line[x]];
+        for (int k = 0; k < scale; k++) {
+          *out++ = color;
+        }
+      }
     }
 
     display.startWrite();
-    display.setAddrWindow(clip.x, clip.y + row, clip.width, rows);
+    display.setAddrWindow(originX, originY + row, scaledWidth, rows);
     display.writePixels(
       pixelBuffer,
       (uint32_t)stripPixels,
@@ -1515,6 +1556,7 @@ void setup() {
   tlClear(timeline);
   clock_.synced = false;
   clock_.startMs = 0;
+  initColorLut();
 
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   display.init(SCREEN_WIDTH, SCREEN_HEIGHT);
