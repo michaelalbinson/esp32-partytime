@@ -33,12 +33,13 @@ bool checkAnimation() {
 
   WiFiClient client;
   HTTPClient http;
-  String url = String("http://") + SERVER_IP + ":5050/api/animation";
+  String url = String("http://") + SERVER_IP + ":5050/api/animation?device=" + DEVICE_NAME;
 
   if (!http.begin(client, url)) return false;
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
+    Serial.printf("Animation check failed: HTTP %d\n", code);
     http.end();
     return false;
   }
@@ -46,11 +47,16 @@ bool checkAnimation() {
   JSONVar info = JSON.parse(http.getString());
   http.end();
 
-  if (JSON.typeof(info) == "undefined") return false;
+  if (JSON.typeof(info) == "undefined") {
+    Serial.println("Failed to parse animation info");
+    return false;
+  }
 
   int newVersion = (int)info["version"];
   int newFrameCount = (int)info["frame_count"];
   int newFrameMs = (int)info["frame_ms"];
+
+  Serial.printf("Animation check: version=%d, frames=%d\n", newVersion, newFrameCount);
 
   if (newFrameMs > 0) animationFrameMs = newFrameMs;
 
@@ -58,6 +64,7 @@ bool checkAnimation() {
     animationVersion = newVersion;
     animationFrameCount = newFrameCount;
     animationFrameIndex = 0;
+    Serial.printf("Animation updated to version %d with %d frames\n", newVersion, newFrameCount);
   }
 
   return true;
@@ -68,12 +75,13 @@ bool showAnimationFrame(int index) {
 
   WiFiClient client;
   HTTPClient http;
-  String url = String("http://") + SERVER_IP + ":5050/api/animation/frame/" + String(index);
+  String url = String("http://") + SERVER_IP + ":5050/api/animation/frame/" + String(index) + "?device=" + DEVICE_NAME;
 
   if (!http.begin(client, url)) return false;
 
   int code = http.GET();
   if (code != HTTP_CODE_OK || http.getSize() != 1024) {
+    Serial.printf("Frame %d fetch failed: HTTP %d, size %d\n", index, code, http.getSize());
     http.end();
     return false;
   }
@@ -83,8 +91,12 @@ bool showAnimationFrame(int index) {
   size_t received = stream->readBytes(bitmap, sizeof(bitmap));
   http.end();
 
-  if (received != sizeof(bitmap)) return false;
+  if (received != sizeof(bitmap)) {
+    Serial.printf("Frame %d short read: %u bytes\n", index, (unsigned int)received);
+    return false;
+  }
 
+  Serial.printf("Displaying frame %d\n", index);
   display.clearDisplay();
   display.drawBitmap(0, 0, bitmap, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
   display.display();
@@ -112,7 +124,7 @@ void showStartup() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("Message display");
+  display.println("Device: " + String(DEVICE_NAME));
   display.println();
   display.println("Connecting to Wi-Fi...");
   display.display();
@@ -128,7 +140,7 @@ void pollServer() {
   WiFiClient client;
   HTTPClient http;
 
-  String url = String("http://") + SERVER_IP + ":5050/api/message?device_id=esp32-demo";
+  String url = String("http://") + SERVER_IP + ":5050/api/message?device=" + DEVICE_NAME + "&screen=ssd1306";
 
   if (!http.begin(client, url)) {
     serverOnline = false;

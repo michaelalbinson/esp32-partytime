@@ -47,7 +47,7 @@ bool checkAnimation() {
 
   WiFiClient client;
   HTTPClient http;
-  String url = String("http://") + SERVER_IP + ":5050/api/animation";
+  String url = String("http://") + SERVER_IP + ":5050/api/animation?device=" + DEVICE_NAME;
 
   if (!http.begin(client, url)) return false;
   http.setTimeout(3000);
@@ -84,7 +84,8 @@ bool fetchAndShowFrame(int index) {
   WiFiClient client;
   HTTPClient http;
   String url = String("http://") + SERVER_IP +
-               ":5050/api/animation/frame/" + String(index);
+               ":5050/api/animation/frame/" + String(index) +
+               "?device=" + DEVICE_NAME;
 
   if (!http.begin(client, url)) return false;
   http.setTimeout(3000);
@@ -116,6 +117,9 @@ void setup() {
   matrix.control(MD_MAX72XX::INTENSITY, 2);
   matrix.clear();
 
+  // Show device name on startup
+  matrix.print(DEVICE_NAME);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -128,6 +132,8 @@ void setup() {
   Serial.println();
   Serial.print("ESP32 IP address: ");
   Serial.println(WiFi.localIP());
+  
+  matrix.clear();
 }
 
 void loop() {

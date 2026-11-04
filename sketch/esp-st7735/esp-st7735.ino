@@ -6,7 +6,7 @@
 #include <Arduino_JSON.h>
 #include <secrets.h>
 
-// Your original working ESP32/display pins
+// Display pins
 #define TFT_CS   5
 #define TFT_DC   2
 #define TFT_RST  4
@@ -16,187 +16,49 @@
 #define SCREEN_WIDTH  240
 #define SCREEN_HEIGHT 320
 
-// Server supplies 128x64 RGB565 frames, high byte first
-#define FRAME_WIDTH  128
-#define FRAME_HEIGHT 64
-#define FRAME_PIXELS (FRAME_WIDTH * FRAME_HEIGHT)
-#define FRAME_BYTES  (FRAME_PIXELS * 2)
+// Maximum RGB332 frame capacity: 144 * 192 pixels.
+// The frame itself may have different dimensions, provided its pixel count
+// fits this buffer and its position/dimensions fit the display.
+#define MAX_FRAME_PIXELS (144 * 192)
 
-#define FRAME_X ((SCREEN_WIDTH - FRAME_WIDTH) / 2)
-#define FRAME_Y ((SCREEN_HEIGHT - FRAME_HEIGHT) / 2)
-
-#define BUFFER_COUNT 3
+// RGB565 conversion buffer. This is wide enough for any strip on the screen.
+#define STRIP_ROWS 16
+#define MAX_STRIP_PIXELS (SCREEN_WIDTH * STRIP_ROWS)
 
 const unsigned long POLL_INTERVAL_MS = 2000;
 
 Adafruit_ST7789 display(TFT_CS, TFT_DC, TFT_RST);
 
-// Three 128x64 RGB565 buffers: about 48 KB total
-uint16_t frameBuffers[BUFFER_COUNT][FRAME_PIXELS];
+// Entire downloaded frame is stored as RGB332, one byte per pixel.
+uint8_t frameBuffer[MAX_FRAME_PIXELS];
 
-QueueHandle_t freeBufferQueue;
-QueueHandle_t readyBufferQueue;
-SemaphoreHandle_t displayMutex;
-
-volatile int animationVersion = -1;
-volatile int animationFrameCount = 0;
-volatile unsigned long animationFrameMs = 120;
+// Reusable buffer for converting and drawing a strip as RGB565.
+uint16_t pixelBuffer[MAX_STRIP_PIXELS];
 
 String currentText = "";
-String currentVersion = "";
-bool serverOnline = false;
-bool animationStarted = false;
 
+bool serverOnline = false;
+bool animationActive = false;
+
+int animationVersion = -1;
+int animationFrameCount = 0;
+int animationFrameIndex = 0;
+
+int frameWidth = 0;
+int frameHeight = 0;
+int frameX = 0;
+int frameY = 0;
+
+unsigned long animationFrameMs = 120;
 unsigned long lastPoll = 0;
 unsigned long lastAnimationFrame = 0;
 
-bool fetchColorFrame(int index, uint16_t* buffer) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + SERVER_IP +
-               ":5050/api/animation/rgb565/frame/" + String(index);
-
-  http.setTimeout(5000);
-
-  if (!http.begin(client, url)) return false;
-
-  int code = http.GET();
-
-  if (code != HTTP_CODE_OK || http.getSize() != FRAME_BYTES) {
-    Serial.printf("Frame %d request failed; HTTP code %d, size %d\n",
-                  index, code, http.getSize());
-    http.end();
-    return false;
-  }
-
-  uint8_t* raw = reinterpret_cast<uint8_t*>(buffer);
-  WiFiClient* stream = http.getStreamPtr();
-  size_t received = stream->readBytes(raw, FRAME_BYTES);
-
-  http.end();
-
-  if (received != FRAME_BYTES) {
-    Serial.printf("Short frame read: %u of %d bytes\n",
-                  (unsigned int)received, FRAME_BYTES);
-    return false;
-  }
-
-  // Convert server's big-endian RGB565 bytes to native uint16_t values.
-  for (int i = 0; i < FRAME_PIXELS; i++) {
-    buffer[i] = (uint16_t(raw[i * 2]) << 8) | raw[i * 2 + 1];
-  }
-
-  return true;
-}
-
-void animationFetcherTask(void* parameter) {
-  uint8_t slot = 0;
-  int nextFrame = 0;
-  int seenVersion = -1;
-
-  while (true) {
-    if (animationFrameCount <= 0) {
-      vTaskDelay(pdMS_TO_TICKS(250));
-      continue;
-    }
-
-    if (xQueueReceive(freeBufferQueue, &slot, portMAX_DELAY) != pdTRUE) {
-      continue;
-    }
-
-    int currentVersionValue = animationVersion;
-    int currentFrameCount = animationFrameCount;
-
-    if (currentVersionValue != seenVersion) {
-      seenVersion = currentVersionValue;
-      nextFrame = 0;
-    }
-
-    if (currentFrameCount <= 0) {
-      xQueueSend(freeBufferQueue, &slot, portMAX_DELAY);
-      continue;
-    }
-
-    if (nextFrame >= currentFrameCount) {
-      nextFrame = 0;
-    }
-
-    if (fetchColorFrame(nextFrame, frameBuffers[slot])) {
-      if (xQueueSend(readyBufferQueue, &slot, portMAX_DELAY) == pdTRUE) {
-        nextFrame = (nextFrame + 1) % currentFrameCount;
-      } else {
-        xQueueSend(freeBufferQueue, &slot, portMAX_DELAY);
-      }
-    } else {
-      xQueueSend(freeBufferQueue, &slot, portMAX_DELAY);
-      vTaskDelay(pdMS_TO_TICKS(250));
-    }
-  }
-}
-
-bool checkAnimation() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + SERVER_IP + ":5050/api/animation/rgb565";
-  http.setTimeout(5000);
-
-  if (!http.begin(client, url)) return false;
-
-  int code = http.GET();
-
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-
-  JSONVar info = JSON.parse(http.getString());
-  http.end();
-
-  if (JSON.typeof(info) == "undefined") {
-    Serial.println("Could not parse animation info");
-    return false;
-  }
-
-  int newVersion = (int)info["version"];
-  int newFrameCount = (int)info["frame_count"];
-  int newFrameMs = (int)info["frame_ms"];
-  int newFrameBytes = (int)info["frame_bytes"];
-
-  if (newFrameBytes != FRAME_BYTES) {
-    Serial.printf("Unexpected frame size: %d bytes; expected %d\n",
-                  newFrameBytes, FRAME_BYTES);
-    return false;
-  }
-
-  if (newFrameMs > 0) {
-    animationFrameMs = (unsigned long)newFrameMs;
-  }
-
-  animationFrameCount = newFrameCount;
-
-  if (newVersion != animationVersion) {
-    animationVersion = newVersion;
-    Serial.printf("Animation updated: %d frames\n", newFrameCount);
-  }
-
-  return true;
-}
-
-void drawScreen() {
-  if (xSemaphoreTake(displayMutex, portMAX_DELAY) != pdTRUE) return;
-
-  // Once animation begins, don't redraw message/status over it.
-  if (animationStarted) {
-    xSemaphoreGive(displayMutex);
+void drawTextScreen() {
+  if (animationActive) {
     return;
   }
 
+  // Clear the previous message/display contents before drawing the current one.
   display.fillScreen(ST77XX_BLACK);
   display.setTextColor(ST77XX_WHITE);
   display.setTextSize(2);
@@ -210,8 +72,6 @@ void drawScreen() {
 
   display.setCursor(8, 60);
   display.println(currentText.length() ? currentText : "Waiting...");
-
-  xSemaphoreGive(displayMutex);
 }
 
 void showStartup() {
@@ -220,15 +80,239 @@ void showStartup() {
   display.setTextSize(2);
   display.setTextWrap(true);
   display.setCursor(8, 12);
-  display.println("Message display");
+  display.println("Device: " + String(DEVICE_NAME));
   display.println();
   display.println("Connecting to Wi-Fi...");
+}
+
+bool checkAnimation() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = String("http://") + SERVER_IP +
+               ":5050/api/animation/jpeg?device=" + DEVICE_NAME;
+
+  http.setTimeout(5000);
+
+  if (!http.begin(client, url)) {
+    Serial.println("Animation check: could not start request");
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Animation check: HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  JSONVar info = JSON.parse(response);
+
+  if (JSON.typeof(info) == "undefined") {
+    Serial.println("Animation check: invalid JSON");
+    return false;
+  }
+
+  int newVersion = (int)info["version"];
+  int newFrameCount = (int)info["frame_count"];
+  int newWidth = (int)info["width"];
+  int newHeight = (int)info["height"];
+  int newX = (int)info["x"];
+  int newY = (int)info["y"];
+  int newFrameMs = (int)info["frame_ms"];
+
+  if (newFrameCount < 0) {
+    newFrameCount = 0;
+  }
+
+  size_t newPixelCount = (size_t)newWidth * (size_t)newHeight;
+
+  // Validate the variable-sized frame against the pixel budget and display.
+  if (newWidth < 1 || newHeight < 1 ||
+      newPixelCount > MAX_FRAME_PIXELS ||
+      newX < 0 || newY < 0 ||
+      newX + newWidth > SCREEN_WIDTH ||
+      newY + newHeight > SCREEN_HEIGHT) {
+    Serial.printf("Invalid frame geometry: %dx%d at %d,%d\n",
+                  newWidth, newHeight, newX, newY);
+    return false;
+  }
+
+  if (newFrameMs > 0) {
+    animationFrameMs = (unsigned long)newFrameMs;
+  }
+
+  if (newVersion != animationVersion) {
+    animationVersion = newVersion;
+    animationFrameIndex = 0;
+    lastAnimationFrame = 0;
+
+    // Clear the previous GIF or message before the new animation starts.
+    display.fillScreen(ST77XX_BLACK);
+
+    Serial.printf("Animation changed: version %d, %d frames, %dx%d\n",
+                  newVersion, newFrameCount, newWidth, newHeight);
+  }
+
+  frameWidth = newWidth;
+  frameHeight = newHeight;
+  frameX = newX;
+  frameY = newY;
+  animationFrameCount = newFrameCount;
+  animationActive = animationFrameCount > 0;
+
+  if (!animationActive) {
+    // Clears the old animation and displays the current message.
+    drawTextScreen();
+  }
+
+  return true;
+}
+
+bool readExact(WiFiClient *stream, uint8_t *buffer, size_t length) {
+  size_t received = 0;
+  unsigned long started = millis();
+
+  while (received < length && millis() - started < 10000) {
+    int availableBytes = stream->available();
+
+    if (availableBytes > 0) {
+      size_t remaining = length - received;
+      size_t toRead = (size_t)availableBytes;
+
+      if (toRead > remaining) {
+        toRead = remaining;
+      }
+
+      size_t count = stream->readBytes(buffer + received, toRead);
+      received += count;
+    } else {
+      if (!stream->connected()) {
+        break;
+      }
+      delay(1);
+    }
+  }
+
+  return received == length;
+}
+
+bool fetchAndDrawFrame(int frameIndex) {
+  if (WiFi.status() != WL_CONNECTED ||
+      frameWidth < 1 || frameHeight < 1) {
+    return false;
+  }
+
+  size_t pixelCount = (size_t)frameWidth * (size_t)frameHeight;
+
+  if (pixelCount > MAX_FRAME_PIXELS) {
+    Serial.println("Frame exceeds RGB332 buffer");
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = String("http://") + SERVER_IP +
+               ":5050/api/animation/jpeg/frame/" + String(frameIndex) +
+               "?device=" + DEVICE_NAME;
+
+  http.setTimeout(10000);
+
+  if (!http.begin(client, url)) {
+    Serial.println("Frame request: could not start request");
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Frame %d request: HTTP %d\n", frameIndex, code);
+    http.end();
+    return false;
+  }
+
+  int contentLength = http.getSize();
+
+  if (contentLength >= 0 && (size_t)contentLength != pixelCount) {
+    Serial.printf("Frame %d has unexpected size: %d; expected %u bytes\n",
+                  frameIndex,
+                  contentLength,
+                  (unsigned int)pixelCount);
+    http.end();
+    return false;
+  }
+
+  // Receive the whole RGB332 frame before drawing any part of it.
+  WiFiClient *stream = http.getStreamPtr();
+
+  if (!readExact(stream, frameBuffer, pixelCount)) {
+    Serial.printf("Frame %d: failed reading full frame\n", frameIndex);
+    http.end();
+    return false;
+  }
+
+  http.end();
+
+  // Convert and draw the completed frame in RGB565 strips.
+  for (int row = 0; row < frameHeight; row += STRIP_ROWS) {
+    int rows = STRIP_ROWS;
+
+    if (row + rows > frameHeight) {
+      rows = frameHeight - row;
+    }
+
+    size_t stripPixels = (size_t)frameWidth * (size_t)rows;
+
+    if (stripPixels > MAX_STRIP_PIXELS) {
+      Serial.println("Strip exceeds RGB565 buffer");
+      return false;
+    }
+
+    size_t sourceOffset = (size_t)row * (size_t)frameWidth;
+
+    for (size_t i = 0; i < stripPixels; i++) {
+      uint8_t c = frameBuffer[sourceOffset + i];
+
+      uint8_t r3 = (c >> 5) & 0x07;
+      uint8_t g3 = (c >> 2) & 0x07;
+      uint8_t b2 = c & 0x03;
+
+      uint8_t r5 = (r3 << 2) | (r3 >> 1);
+      uint8_t g6 = (g3 << 3) | g3;
+      uint8_t b5 = (b2 << 3) | (b2 << 1) | (b2 >> 1);
+
+      pixelBuffer[i] = ((uint16_t)r5 << 11) |
+                       ((uint16_t)g6 << 5) |
+                       b5;
+    }
+
+    display.startWrite();
+    display.setAddrWindow(frameX, frameY + row, frameWidth, rows);
+    display.writePixels(
+      pixelBuffer,
+      (uint32_t)stripPixels,
+      true,
+      false
+    );
+    display.endWrite();
+  }
+
+  return true;
 }
 
 void pollServer() {
   if (WiFi.status() != WL_CONNECTED) {
     serverOnline = false;
-    drawScreen();
+    drawTextScreen();
     return;
   }
 
@@ -236,13 +320,14 @@ void pollServer() {
   HTTPClient http;
 
   String url = String("http://") + SERVER_IP +
-               ":5050/api/message?device_id=esp32-demo";
+               ":5050/api/message?device=" + DEVICE_NAME +
+               "&screen=st7735";
 
   http.setTimeout(5000);
 
   if (!http.begin(client, url)) {
     serverOnline = false;
-    drawScreen();
+    drawTextScreen();
     return;
   }
 
@@ -253,51 +338,35 @@ void pollServer() {
     JSONVar doc = JSON.parse(response);
 
     if (JSON.typeof(doc) != "undefined") {
-      String newText = (const char*)doc["text"];
-      String newVersion = JSON.stringify(doc["version"]);
-
+      currentText = (const char *)doc["text"];
       serverOnline = true;
-
-      if (newText != currentText || newVersion != currentVersion) {
-        currentText = newText;
-        currentVersion = newVersion;
-        drawScreen();
-      }
     } else {
+      Serial.println("Message poll: invalid JSON");
       serverOnline = false;
-      drawScreen();
     }
   } else {
+    Serial.printf("Message poll: HTTP %d\n", code);
     serverOnline = false;
-    drawScreen();
   }
 
   http.end();
+
+  // drawTextScreen() clears the display before showing the current message.
+  // It does nothing while an animation is active.
+  drawTextScreen();
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
 
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-
   display.init(SCREEN_WIDTH, SCREEN_HEIGHT);
   display.setRotation(0);
   showStartup();
 
-  displayMutex = xSemaphoreCreateMutex();
-  freeBufferQueue = xQueueCreate(BUFFER_COUNT, sizeof(uint8_t));
-  readyBufferQueue = xQueueCreate(BUFFER_COUNT, sizeof(uint8_t));
-
-  if (displayMutex == nullptr ||
-      freeBufferQueue == nullptr ||
-      readyBufferQueue == nullptr) {
-    Serial.println("Could not create display/buffer queues");
-    while (true) delay(1000);
-  }
-
-  for (uint8_t i = 0; i < BUFFER_COUNT; i++) {
-    xQueueSend(freeBufferQueue, &i, portMAX_DELAY);
-  }
+  Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+  Serial.printf("Largest free block: %u\n", ESP.getMaxAllocHeap());
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -313,55 +382,33 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   currentText = "Waiting for server";
-  drawScreen();
 
   checkAnimation();
+  drawTextScreen();
 
-  BaseType_t taskCreated = xTaskCreate(
-    animationFetcherTask,
-    "AnimationFetcher",
-    8192,
-    nullptr,
-    1,
-    nullptr
-  );
-
-  if (taskCreated != pdPASS) {
-    Serial.println("Could not create animation fetch task");
-  }
+  lastPoll = millis();
 }
 
 void loop() {
-  if (millis() - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = millis();
+  unsigned long now = millis();
+
+  if (now - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = now;
     pollServer();
     checkAnimation();
   }
 
-  if (millis() - lastAnimationFrame >= animationFrameMs) {
-    uint8_t slot;
+  if (animationActive &&
+      animationFrameCount > 0 &&
+      now - lastAnimationFrame >= animationFrameMs) {
+    lastAnimationFrame = now;
 
-    if (xQueueReceive(readyBufferQueue, &slot, 0) == pdTRUE) {
-      if (xSemaphoreTake(displayMutex, portMAX_DELAY) == pdTRUE) {
-        // Clear the status/message screen once, on the first GIF frame.
-        if (!animationStarted) {
-          display.fillScreen(ST77XX_BLACK);
-          animationStarted = true;
-        }
+    if (fetchAndDrawFrame(animationFrameIndex)) {
+      animationFrameIndex++;
 
-        display.drawRGBBitmap(
-          FRAME_X,
-          FRAME_Y,
-          frameBuffers[slot],
-          FRAME_WIDTH,
-          FRAME_HEIGHT
-        );
-
-        xSemaphoreGive(displayMutex);
+      if (animationFrameIndex >= animationFrameCount) {
+        animationFrameIndex = 0;
       }
-
-      xQueueSend(freeBufferQueue, &slot, portMAX_DELAY);
-      lastAnimationFrame = millis();
     }
   }
 
