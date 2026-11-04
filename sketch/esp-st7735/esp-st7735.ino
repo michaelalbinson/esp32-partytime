@@ -51,7 +51,18 @@ int frameY = 0;
 
 unsigned long animationFrameMs = 120;
 unsigned long lastPoll = 0;
-unsigned long lastAnimationFrame = 0;
+
+// Per-frame display time from the GIF. Falls back to animationFrameMs.
+#define MAX_ANIMATION_FRAMES 60
+uint16_t frameDelays[MAX_ANIMATION_FRAMES];
+// The next frame is fetched right after the current one is drawn, then drawn
+// at nextFrameAt. Network latency therefore only matters if a fetch takes
+// longer than the frame's delay.
+bool frameReady = false;         // frameBuffer holds frame animationFrameIndex
+bool animationResync = true;     // next draw starts a fresh schedule
+unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
+unsigned long lastFrameFetch = 0;
+const unsigned long FRAME_RETRY_MS = 250;
 
 void drawTextScreen() {
   if (animationActive) {
@@ -152,10 +163,12 @@ bool checkAnimation() {
     animationFrameMs = (unsigned long)newFrameMs;
   }
 
+  loadFrameDelays(info);
+
   if (newVersion != animationVersion) {
     animationVersion = newVersion;
     animationFrameIndex = 0;
-    lastAnimationFrame = 0;
+    restartAnimationSchedule();
 
     // Clear the previous GIF or message before the new animation starts.
     display.fillScreen(ST77XX_BLACK);
@@ -210,7 +223,53 @@ bool readExact(WiFiClient *stream, uint8_t *buffer, size_t length) {
   return received == length;
 }
 
-bool fetchAndDrawFrame(int frameIndex) {
+// Read the per-frame delays the server sends from the GIF's metadata.
+void loadFrameDelays(JSONVar& info) {
+  JSONVar delays = info["frame_delays"];
+  int count = 0;
+
+  if (JSON.typeof(delays) == "array") {
+    count = delays.length();
+    if (count > MAX_ANIMATION_FRAMES) count = MAX_ANIMATION_FRAMES;
+  }
+
+  for (int i = 0; i < MAX_ANIMATION_FRAMES; i++) {
+    int ms = (i < count) ? (int)delays[i] : 0;
+    frameDelays[i] = (ms > 0 && ms < 65535) ? ms : 0;
+  }
+}
+
+unsigned long delayForFrame(int index) {
+  if (index >= 0 && index < MAX_ANIMATION_FRAMES && frameDelays[index] > 0) {
+    return frameDelays[index];
+  }
+  return animationFrameMs;
+}
+
+// Set the deadline for the frame after the one drawn at "now". The deadline
+// advances by exactly the frame's delay so timing doesn't drift; if we have
+// fallen a whole frame behind (slow network), restart the schedule instead.
+void scheduleNextFrame(unsigned long now, int drawnIndex) {
+  unsigned long d = delayForFrame(drawnIndex);
+
+  if (animationResync || (long)(now - nextFrameAt) >= (long)d) {
+    nextFrameAt = now + d;
+  } else {
+    nextFrameAt += d;
+  }
+
+  animationResync = false;
+}
+
+// Throw away any prefetched frame and start the schedule over.
+void restartAnimationSchedule() {
+  frameReady = false;
+  animationResync = true;
+  nextFrameAt = millis();
+}
+
+// Download a frame into frameBuffer without drawing it.
+bool fetchFrame(int frameIndex) {
   if (WiFi.status() != WL_CONNECTED ||
       frameWidth < 1 || frameHeight < 1) {
     return false;
@@ -266,8 +325,11 @@ bool fetchAndDrawFrame(int frameIndex) {
   }
 
   http.end();
+  return true;
+}
 
-  // Convert and draw the completed frame in RGB565 strips.
+// Convert the buffered frame and draw it in RGB565 strips.
+bool drawFrame() {
   for (int row = 0; row < frameHeight; row += STRIP_ROWS) {
     int rows = STRIP_ROWS;
 
@@ -403,12 +465,26 @@ void loop() {
     checkAnimation();
   }
 
+  if (animationActive && animationFrameCount > 0) {
+    // Prefetch the next frame as soon as the previous one is on screen.
+    if (!frameReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
+      lastFrameFetch = now;
+      frameReady = fetchFrame(animationFrameIndex);
+    }
+
+    now = millis();
+  }
+
   if (animationActive &&
       animationFrameCount > 0 &&
-      now - lastAnimationFrame >= animationFrameMs) {
-    lastAnimationFrame = now;
+      frameReady &&
+      (long)(now - nextFrameAt) >= 0) {
+    bool drawn = drawFrame();
+    frameReady = false;
+    lastFrameFetch = 0;
 
-    if (fetchAndDrawFrame(animationFrameIndex)) {
+    if (drawn) {
+      scheduleNextFrame(now, animationFrameIndex);
       animationFrameIndex++;
 
       if (animationFrameIndex >= animationFrameCount) {

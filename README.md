@@ -212,9 +212,12 @@ Returns animation metadata for the specified device.
 {
   "version": 1,
   "frame_count": 24,
-  "frame_ms": 120
+  "frame_ms": 120,
+  "frame_delays": [120, 120, "... one entry per frame"]
 }
 ```
+
+`frame_delays` holds each frame's display time in milliseconds, taken from the uploaded GIF. `frame_ms` is their mean, for firmware that only supports a single delay. As in browsers, GIF delays of 10 ms or less are played as 100 ms. Animations stored before this was added fall back to 120 ms per frame. The same two fields appear in the other animation metadata endpoints below.
 
 #### `GET /api/animation/frame/<index>?device=<name>`
 Returns a single monochrome animation frame as binary data (1,024 bytes, 128×64 pixels, 1-bit packed).

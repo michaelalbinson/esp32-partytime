@@ -22,6 +22,15 @@ DEVICE_TIMEOUT_SECONDS = int(os.getenv("DEVICE_TIMEOUT_SECONDS", "10"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))  # Retained for compatibility.
 
+# Fallback per-frame delay when a GIF carries none (or an animation predates
+# stored delays).
+DEFAULT_FRAME_MS = 120
+
+# Browsers treat GIF delays of 10 ms or less as "unspecified" and play them at
+# 100 ms. Match that so animations look the same on the device as in a browser.
+MIN_GIF_DELAY_MS = 10
+UNSPECIFIED_GIF_DELAY_MS = 100
+
 # The ESP32 RGB332 frame buffer can hold at most 144 * 192 pixels.
 ANIM_MAX_PIXELS = 144 * 192
 
@@ -108,6 +117,34 @@ def new_device(screen_type="ssd1306", last_seen=None):
             "rgb332_frames": [],
         },
     }
+
+
+def gif_frame_delay_ms(frame):
+    """Return a GIF frame's display time in ms, following browser rules."""
+    try:
+        delay = int(frame.info.get("duration", 0))
+    except (TypeError, ValueError):
+        delay = 0
+
+    if delay <= MIN_GIF_DELAY_MS:
+        return UNSPECIFIED_GIF_DELAY_MS
+
+    return delay
+
+
+def frame_timing(anim, frame_count):
+    """
+    Build the timing fields devices need: per-frame delays, plus the mean as
+    frame_ms for firmware that only understands a single delay.
+    """
+    delays = anim.get("frame_delays_ms") or []
+
+    if len(delays) != frame_count:
+        delays = [DEFAULT_FRAME_MS] * frame_count
+
+    frame_ms = round(sum(delays) / len(delays)) if delays else DEFAULT_FRAME_MS
+
+    return {"frame_ms": frame_ms, "frame_delays": delays}
 
 
 def get_animation(device_id):
@@ -246,6 +283,7 @@ def upload_animation():
             return jsonify(error="The uploaded file must be a GIF"), 400
 
         rgba_frames = []
+        frame_delays_ms = []
         content_bbox = None
 
         # Collect frames and find one bounding box around visible content
@@ -253,6 +291,9 @@ def upload_animation():
         for source_frame in ImageSequence.Iterator(image):
             if len(rgba_frames) >= MAX_FRAMES:
                 break
+
+            # Read the delay before convert(), which drops frame metadata.
+            frame_delays_ms.append(gif_frame_delay_ms(source_frame))
 
             rgba = source_frame.convert("RGBA")
             rgba_frames.append(rgba.copy())
@@ -366,6 +407,7 @@ def upload_animation():
             "color_frames": [],
             "jpeg_frames": [],
             "rgb332_frames": encoded_frames,
+            "frame_delays_ms": frame_delays_ms,
             "rgb332_width": output_width,
             "rgb332_height": output_height,
             "rgb332_x": x,
@@ -386,6 +428,7 @@ def upload_animation():
     return jsonify(
         version=version,
         frame_count=len(encoded_frames),
+        **frame_timing(devices[device_id]["animation"], len(encoded_frames)),
         width=output_width,
         height=output_height,
         x=x,
@@ -408,7 +451,7 @@ def get_animation_info():
         return jsonify(
             version=anim.get("version", 0),
             frame_count=len(anim.get("frames", [])),
-            frame_ms=120,
+            **frame_timing(anim, len(anim.get("frames", []))),
         )
 
 
@@ -451,7 +494,7 @@ def get_color_animation_info():
         return jsonify(
             version=anim.get("version", 0),
             frame_count=len(frames),
-            frame_ms=120,
+            **frame_timing(anim, len(frames)),
             width=128,
             height=64,
             format="rgb565-be",
@@ -504,7 +547,7 @@ def get_jpeg_animation_info():
         return jsonify(
             version=anim.get("version", 0),
             frame_count=len(frames),
-            frame_ms=120,
+            **frame_timing(anim, len(frames)),
             width=width,
             height=height,
             x=int(anim.get("rgb332_x", 0)),

@@ -21,7 +21,19 @@ int animationVersion = -1;
 int animationFrameCount = 0;
 int animationFrameIndex = 0;
 unsigned long animationFrameMs = 120;
-unsigned long lastAnimationFrame = 0;
+
+// Per-frame display time from the GIF. Falls back to animationFrameMs.
+#define MAX_ANIMATION_FRAMES 60
+uint16_t frameDelays[MAX_ANIMATION_FRAMES];
+// The next frame is fetched right after the current one is drawn, then drawn
+// at nextFrameAt. Network latency therefore only matters if a fetch takes
+// longer than the frame's delay.
+bool frameReady = false;         // buffer holds frame animationFrameIndex
+bool animationResync = true;     // next draw starts a fresh schedule
+unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
+unsigned long lastFrameFetch = 0;
+const unsigned long FRAME_RETRY_MS = 250;
+uint8_t frameBitmap[SOURCE_BYTES];
 unsigned long lastAnimationCheck = 0;
 
 void showMatrixFrame(const uint8_t* bitmap) {
@@ -68,17 +80,65 @@ bool checkAnimation() {
   int newFrameMs = (int)info["frame_ms"];
 
   if (newFrameMs > 0) animationFrameMs = newFrameMs;
+  loadFrameDelays(info);
 
   if (newVersion != animationVersion) {
     animationVersion = newVersion;
     animationFrameCount = newFrameCount;
     animationFrameIndex = 0;
+    restartAnimationSchedule();
   }
 
   return true;
 }
 
-bool fetchAndShowFrame(int index) {
+// Read the per-frame delays the server sends from the GIF's metadata.
+void loadFrameDelays(JSONVar& info) {
+  JSONVar delays = info["frame_delays"];
+  int count = 0;
+
+  if (JSON.typeof(delays) == "array") {
+    count = delays.length();
+    if (count > MAX_ANIMATION_FRAMES) count = MAX_ANIMATION_FRAMES;
+  }
+
+  for (int i = 0; i < MAX_ANIMATION_FRAMES; i++) {
+    int ms = (i < count) ? (int)delays[i] : 0;
+    frameDelays[i] = (ms > 0 && ms < 65535) ? ms : 0;
+  }
+}
+
+unsigned long delayForFrame(int index) {
+  if (index >= 0 && index < MAX_ANIMATION_FRAMES && frameDelays[index] > 0) {
+    return frameDelays[index];
+  }
+  return animationFrameMs;
+}
+
+// Set the deadline for the frame after the one drawn at "now". The deadline
+// advances by exactly the frame's delay so timing doesn't drift; if we have
+// fallen a whole frame behind (slow network), restart the schedule instead.
+void scheduleNextFrame(unsigned long now, int drawnIndex) {
+  unsigned long d = delayForFrame(drawnIndex);
+
+  if (animationResync || (long)(now - nextFrameAt) >= (long)d) {
+    nextFrameAt = now + d;
+  } else {
+    nextFrameAt += d;
+  }
+
+  animationResync = false;
+}
+
+// Throw away any prefetched frame and start the schedule over.
+void restartAnimationSchedule() {
+  frameReady = false;
+  animationResync = true;
+  nextFrameAt = millis();
+}
+
+// Download a frame into frameBitmap without drawing it.
+bool fetchFrame(int index) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClient client;
@@ -96,15 +156,11 @@ bool fetchAndShowFrame(int index) {
     return false;
   }
 
-  uint8_t bitmap[SOURCE_BYTES];
   WiFiClient* stream = http.getStreamPtr();
-  size_t received = stream->readBytes(bitmap, sizeof(bitmap));
+  size_t received = stream->readBytes(frameBitmap, sizeof(frameBitmap));
   http.end();
 
-  if (received != sizeof(bitmap)) return false;
-
-  showMatrixFrame(bitmap);
-  return true;
+  return received == sizeof(frameBitmap);
 }
 
 void setup() {
@@ -150,13 +206,21 @@ void loop() {
     checkAnimation();
   }
 
-  if (animationFrameCount > 0 &&
-      now - lastAnimationFrame >= animationFrameMs) {
-    lastAnimationFrame = now;
+  if (animationFrameCount > 0) {
+    // Prefetch the next frame as soon as the previous one is on screen.
+    if (!frameReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
+      lastFrameFetch = now;
+      frameReady = fetchFrame(animationFrameIndex);
+    }
 
-    if (fetchAndShowFrame(animationFrameIndex)) {
-      animationFrameIndex =
-          (animationFrameIndex + 1) % animationFrameCount;
+    now = millis();
+
+    if (frameReady && (long)(now - nextFrameAt) >= 0) {
+      showMatrixFrame(frameBitmap);
+      scheduleNextFrame(now, animationFrameIndex);
+      animationFrameIndex = (animationFrameIndex + 1) % animationFrameCount;
+      frameReady = false;
+      lastFrameFetch = 0;
     }
   }
 
