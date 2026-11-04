@@ -29,20 +29,25 @@ const unsigned long POLL_INTERVAL_MS = 2000;
 
 Adafruit_ST7789 display(TFT_CS, TFT_DC, TFT_RST);
 
-// Entire downloaded frame is stored as RGB332, one byte per pixel.
-uint8_t frameBuffer[MAX_FRAME_PIXELS];
+// Frames are stored as RGB332, one byte per pixel, in malloc'd buffers (see the
+// frame cache below). There is no static frame buffer, so that RAM stays free.
 
 // Frames are cached in RAM after their first download so playback doesn't wait
 // on the network. Each frame gets its own malloc'd slot (no big contiguous block
 // needed). Caching stops at the byte budget, or when free heap would drop below
-// the reserve kept for WiFi/HTTP/JSON; remaining frames stream via frameBuffer.
+// the reserve kept for WiFi/HTTP/JSON; any frames that don't fit stream through
+// streamBuffer, which is only allocated if that happens. The server sizes
+// frames so a whole animation fits (ANIM_CACHE_BYTES in app.py matches
+// CACHE_BUDGET_BYTES).
 #define MAX_CACHE_FRAMES 60
-#define CACHE_BUDGET_BYTES (90 * 1024)
-#define HEAP_RESERVE_BYTES (70 * 1024)
+#define CACHE_BUDGET_BYTES (120 * 1024)
+#define HEAP_RESERVE_BYTES (55 * 1024)
 uint8_t *frameCache[MAX_CACHE_FRAMES];
 size_t cacheBytes = 0;
 int cachedFrames = 0;
-// Buffer holding the frame that is ready to draw (a cache slot or frameBuffer).
+uint8_t *streamBuffer = nullptr;
+size_t streamBufferSize = 0;
+// Buffer holding the frame that is ready to draw (a cache slot or streamBuffer).
 const uint8_t *readyFrame = nullptr;
 bool readyFromCache = false;
 
@@ -291,6 +296,22 @@ void freeFrameCache() {
   cacheBytes = 0;
   cachedFrames = 0;
   readyFrame = nullptr;
+
+  if (streamBuffer) {
+    free(streamBuffer);
+    streamBuffer = nullptr;
+    streamBufferSize = 0;
+  }
+}
+
+// Scratch buffer for frames that didn't fit in the cache.
+uint8_t *getStreamBuffer(size_t size) {
+  if (streamBuffer && streamBufferSize >= size) return streamBuffer;
+
+  if (streamBuffer) free(streamBuffer);
+  streamBuffer = (uint8_t *)malloc(size);
+  streamBufferSize = streamBuffer ? size : 0;
+  return streamBuffer;
 }
 
 // Try to reserve a cache slot for a frame; returns nullptr if over budget or
@@ -536,9 +557,9 @@ void loop() {
         frameReady = true;
       } else {
         uint8_t *slot = allocCacheSlot(animationFrameIndex, pixelCount);
-        uint8_t *dest = slot ? slot : frameBuffer;
+        uint8_t *dest = slot ? slot : getStreamBuffer(pixelCount);
 
-        frameReady = fetchFrame(animationFrameIndex, dest);
+        frameReady = dest && fetchFrame(animationFrameIndex, dest);
 
         if (frameReady) {
           readyFrame = dest;

@@ -34,6 +34,14 @@ MIN_GIF_DELAY_MS = 10
 # The ESP32 RGB332 frame buffer can hold at most 144 * 192 pixels.
 ANIM_MAX_PIXELS = 144 * 192
 
+# The ST7735 keeps the whole animation in RAM so playback doesn't wait on
+# WiFi. Frames are 1 byte per pixel, so every frame's pixel count is capped at
+# ANIM_CACHE_BYTES / frame_count. Keep this in step with CACHE_BUDGET_BYTES in
+# sketch/esp-st7735. Many-frame GIFs stop shrinking at ANIM_MIN_PIXELS and the
+# frames that then don't fit are streamed.
+ANIM_CACHE_BYTES = 120 * 1024
+ANIM_MIN_PIXELS = 64 * 64
+
 SCREEN_WIDTH = 240
 SCREEN_HEIGHT = 320
 
@@ -330,13 +338,20 @@ def upload_animation():
         crop_height = max(1, bottom - top)
         crop_pixels = crop_width * crop_height
 
+        # Per-frame pixel budget: small enough that every frame fits the
+        # device's RAM cache, within the hard limits.
+        frame_pixel_budget = max(
+            ANIM_MIN_PIXELS,
+            min(ANIM_MAX_PIXELS, ANIM_CACHE_BYTES // len(rgba_frames)),
+        )
+
         # Fit within the display and the ESP32's pixel-count budget.
         # Unlike a fixed target rectangle, this lets wide or tall GIFs
         # use more of the available pixels.
         scale = min(
             SCREEN_WIDTH / crop_width,
             SCREEN_HEIGHT / crop_height,
-            (ANIM_MAX_PIXELS / crop_pixels) ** 0.5,
+            (frame_pixel_budget / crop_pixels) ** 0.5,
         )
 
         # Floor dimensions so the resulting frame cannot exceed the budget.
@@ -344,7 +359,7 @@ def upload_animation():
         output_height = max(1, int(crop_height * scale))
 
         # Guard against a floating-point rounding edge case.
-        while output_width * output_height > ANIM_MAX_PIXELS:
+        while output_width * output_height > frame_pixel_budget:
             if output_width / crop_width >= output_height / crop_height:
                 output_width -= 1
             else:
