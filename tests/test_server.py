@@ -30,6 +30,26 @@ def make_gif(frame_count=3, delay=100, size=(40, 30)):
     return buf.getvalue()
 
 
+def make_png(size=(60, 40), color=(200, 30, 30), transparent=False):
+    mode = "RGBA" if transparent else "RGB"
+    fill = color + (0,) if transparent else color
+    image = Image.new(mode, size, fill)
+    if transparent:
+        for x in range(10, 50):
+            for y in range(8, 32):
+                image.putpixel((x, y), color + (255,))
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def make_apng(frame_count=3, delay=80, size=(30, 20)):
+    frames = [Image.new("RGB", size, (i * 70 % 256, 40, 90)) for i in range(frame_count)]
+    buf = io.BytesIO()
+    frames[0].save(buf, "PNG", save_all=True, append_images=frames[1:], duration=delay, loop=0)
+    return buf.getvalue()
+
+
 class FrameMathTests(unittest.TestCase):
     def test_allocate_leaves_small_totals_alone(self):
         self.assertEqual(allocate_frames([10, 20], 60), [10, 20])
@@ -375,6 +395,67 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.mimetype, "image/gif")
         self.assertEqual(response.data[:3], b"GIF")
         response.close()
+
+    def upload_bytes(self, data, name):
+        return self.client.post(
+            "/api/gifs",
+            data={"gif": (io.BytesIO(data), name)},
+            content_type="multipart/form-data",
+        )
+
+    def test_png_stills_work_in_shows(self):
+        response = self.upload_bytes(make_png(transparent=True), "logo.png")
+        self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+        entry = response.get_json()
+        self.assertEqual((entry["format"], entry["frame_count"], entry["name"]),
+                         ("PNG", 1, "logo"))
+
+        preview = self.client.get(f"/api/gifs/{entry['id']}/file")
+        self.assertEqual((preview.status_code, preview.mimetype), (200, "image/png"))
+        preview.close()
+
+        show = self.make_show([
+            {"device": "oled", "steps": [{"type": "gif", "gif": entry["id"], "seconds": 4}]},
+            {"device": "tft", "steps": [
+                {"type": "gif", "gif": entry["id"], "seconds": 4},
+                {"type": "effect", "effect": "static", "seconds": 1}]},
+        ])
+        self.assertEqual(self.client.post(f"/api/shows/{show['id']}/play").status_code, 200)
+
+        tft = self.client.get("/api/animation/jpeg?device=tft").get_json()
+        self.assertEqual(tft["frame_count"], 1)
+        self.assertEqual(tft["frame_delays"], [1000])
+        clip = tft["program"]["clips"][0]
+        # Cropped to the visible 40x24 area, and a single frame gets the whole
+        # per-frame budget (27,648 px), at the same aspect ratio.
+        self.assertEqual((clip["width"], clip["height"]), (214, 128))
+        self.assertLessEqual(clip["width"] * clip["height"], 144 * 192)
+        self.assertEqual(len(self.client.get("/api/animation/frame/0?device=oled").data), 1024)
+        self.assertEqual(len(self.client.get("/api/animation/jpeg/frame/0?device=tft").data),
+                         clip["width"] * clip["height"])
+        self.assertEqual(self.client.get("/api/devices/oled").get_json()["now_playing"]["name"], "logo")
+
+    def test_animated_png_plays_like_a_gif(self):
+        entry = self.upload_bytes(make_apng(frame_count=3, delay=80), "spin.png").get_json()
+        self.assertEqual((entry["format"], entry["frame_count"], entry["duration_ms"]),
+                         ("PNG", 3, 240))
+
+    def test_other_formats_are_refused_clearly(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10)).save(buf, "JPEG")
+        response = self.upload_bytes(buf.getvalue(), "photo.jpg")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "The uploaded file must be a GIF or PNG")
+        self.assertEqual(self.upload_bytes(b"nope", "x.png").status_code, 400)
+
+    def test_quick_upload_accepts_a_png(self):
+        response = self.client.post(
+            "/api/animation?device=oled",
+            data={"gif": (io.BytesIO(make_png()), "x.png")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["frame_count"], 1)
 
     def test_shows_page_renders(self):
         self.assertEqual(self.client.get("/shows").status_code, 200)

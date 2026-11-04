@@ -10,16 +10,16 @@
   <a href="/" class="back-link">← Back to message editor</a>
   <h1>GIF Shows</h1>
   <p class="intro">
-    A show has one lane per display. Each lane plays its steps in order and then
-    loops; all lanes start together, so use waits to stagger a GIF from one
+    A show has one lane per display. Each lane plays its steps in order (GIFs,
+    still PNGs, effects, text) and then loops; all lanes start together, so use waits to stagger a GIF from one
     display to the next.
   </p>
 
   <section class="panel">
-    <h2>GIF library</h2>
+    <h2>Image library</h2>
     <form id="upload-form" class="row">
-      <input id="upload-file" type="file" accept="image/gif" multiple>
-      <button type="submit">Add GIFs</button>
+      <input id="upload-file" type="file" accept="image/gif,image/png" multiple>
+      <button type="submit">Add images</button>
       <span id="upload-result" class="muted"></span>
     </form>
     <div id="library" class="library"></div>

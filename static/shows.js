@@ -79,7 +79,7 @@ function renderLibrary() {
   library.replaceChildren();
 
   if (!state.gifs.length) {
-    library.append(h("p", { class: "muted" }, "No GIFs yet. Add some above."));
+    library.append(h("p", { class: "muted" }, "No images yet. Add some above."));
     return;
   }
 
@@ -87,7 +87,7 @@ function renderLibrary() {
     library.append(h("div", { class: "gif-card" },
       h("img", { src: `/api/gifs/${gif.id}/file`, alt: gif.name, loading: "lazy" }),
       h("div", { class: "name", title: gif.name }, gif.name),
-      h("div", { class: "meta" }, `${gif.frame_count} frames · ${fmtSeconds(gif.duration_ms / 1000)}`),
+      h("div", { class: "meta" }, gif.frame_count === 1 ? "still image" : `${gif.frame_count} frames · ${fmtSeconds(gif.duration_ms / 1000)}`),
       h("button", { type: "button", class: "danger", onclick: () => deleteGif(gif) }, "Delete"),
     ));
   }
@@ -142,7 +142,10 @@ const cycleSeconds = () => Math.max(0, ...state.show.lanes.map(laneSeconds));
 function defaultStep() {
   const gif = state.gifs[0];
   if (!gif) return { type: "wait", seconds: 5 };
-  return { type: "gif", gif: gif.id, seconds: Math.max(1, Math.round(gif.duration_ms / 100) / 10) };
+  // A still has no length of its own: give it a few seconds. Animations get
+  // one loop.
+  const seconds = gif.frame_count === 1 ? 5 : Math.max(1, Math.round(gif.duration_ms / 100) / 10);
+  return { type: "gif", gif: gif.id, seconds };
 }
 
 function newShow(device) {
@@ -206,7 +209,7 @@ function updateTotals() {
       const step = lane.steps[stepIndex];
       const gif = step.type === "gif" ? gifById(step.gif) : null;
       const loops = stepEl.querySelector(".loops");
-      loops.textContent = gif && gif.duration_ms
+      loops.textContent = gif && gif.frame_count > 1 && gif.duration_ms
         ? `≈ ${Math.round(((step.seconds * 1000) / gif.duration_ms) * 10) / 10} loops`
         : "";
     });
@@ -236,7 +239,7 @@ function stepOptions(step) {
   const gifGroup = state.gifs.map((gif) =>
     h("option", { value: `gif:${gif.id}`, selected: stepValue(step) === `gif:${gif.id}` }, gif.name));
   const missing = step.type === "gif" && !gifById(step.gif)
-    ? [h("option", { value: `gif:${step.gif}`, selected: true }, "(missing GIF)")]
+    ? [h("option", { value: `gif:${step.gif}`, selected: true }, "(missing image)")]
     : [];
 
   const current = stepValue(step);
@@ -246,7 +249,7 @@ function stepOptions(step) {
       ...EFFECTS.map(([id, label]) => h("option", { value: `effect:${id}`, selected: current === `effect:${id}` }, `✨ ${label}`))),
     h("optgroup", { label: "Text" },
       ...TEXT_STYLES.map(([id, label]) => h("option", { value: `text:${id}`, selected: current === `text:${id}` }, `💬 ${label}`))),
-    h("optgroup", { label: "GIFs" }, ...gifGroup, ...missing),
+    h("optgroup", { label: "Images" }, ...gifGroup, ...missing),
   ];
 }
 

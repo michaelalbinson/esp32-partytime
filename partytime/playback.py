@@ -4,7 +4,7 @@ import logging
 import time
 
 from .config import EFFECTS, TEXT_STYLES
-from .media.gif import GifError
+from .media.image import ImageError
 from .program import WAIT, Effect, ProgramError, Text, build_animation
 from .protocol import cycle_position_ms
 
@@ -111,7 +111,7 @@ def play_show(registry, library, show):
                 gif_id = step.get("gif")
                 if gif_id and gif_id not in sources:
                     sources[gif_id] = library.load_source(gif_id)
-    except GifError as error:
+    except ImageError as error:
         raise PlaybackError(str(error)) from error
 
     with registry.lock:
@@ -236,7 +236,7 @@ def _render_resume(library, resume):
         animation, _ = build_animation(
             [(resume["gif"], source.duration_ms)], {resume["gif"]: source}
         )
-    except (GifError, ProgramError):
+    except (ImageError, ProgramError):
         return None  # it was deleted or no longer renders: show the message
 
     return animation

@@ -6,7 +6,7 @@ import logging
 from flask import Blueprint, Response, jsonify, request
 
 from .. import config
-from ..media.gif import GifError, read_gif
+from ..media.image import ImageError, read_image
 from ..playback import install
 from ..program import build_animation
 from ..protocol import color_metadata, mono_metadata
@@ -56,8 +56,8 @@ def _frame_response(device_id, index, key):
 @bp.post("/api/animation")
 def upload_animation():
     """
-    Upload a GIF and play it on a device straight away. The GIF also joins the
-    library, so it can be used in shows.
+    Upload a GIF (or PNG) and play it on a device straight away. It also joins
+    the library, so it can be used in shows.
     """
     services_ = services()
     device_id = request.args.get("device", "default")
@@ -71,13 +71,13 @@ def upload_animation():
         return jsonify(error="GIF must be 5 MB or smaller"), 413
 
     try:
-        source = read_gif(raw)
+        source = read_image(raw)
         entry = services_.library.add(raw, uploaded.filename, source)
         animation, _ = build_animation(
             [(entry["id"], source.duration_ms)],
             {entry["id"]: source},
         )
-    except GifError as error:
+    except ImageError as error:
         logger.warning("GIF processing failed: %s", error)
         return jsonify(error=str(error)), 400
 

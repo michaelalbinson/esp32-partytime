@@ -236,7 +236,7 @@ Both metadata endpoints include `program` whenever something is playing (see Sho
 
 A show has one **lane per display**. A lane is an ordered list of steps, played in order and then looped:
 
-- **GIF**: a library GIF, repeated for the step's number of seconds (cut off when time runs out)
+- **GIF** (`type: "gif"`): a library image, repeated for the step's number of seconds (cut off when time runs out). The library takes GIFs and PNGs: a PNG is a still, held for the whole step, and an animated PNG plays like a GIF. PNG transparency is composited onto black.
 - **Wait**: the display shows its text message
 - **Effect**: drawn by the device itself at the display's full native resolution. Each moves by the show clock, so they match across displays:
 
@@ -259,7 +259,7 @@ A lane can hold at most 24 steps, 16 different GIFs and `MAX_FRAMES` frames in t
 
 Build shows at `/shows`, or through the API:
 
-- `GET /api/gifs`, `POST /api/gifs` (multipart `gif`), `GET /api/gifs/<id>/file`, `DELETE /api/gifs/<id>` (refused while a show uses it)
+- `GET /api/gifs`, `POST /api/gifs` (multipart `gif`; a GIF or PNG), `GET /api/gifs/<id>/file`, `DELETE /api/gifs/<id>` (refused while a show uses it). The name is from when the library only held GIFs.
 - `GET /api/shows`, `POST /api/shows`, `GET|PUT|DELETE /api/shows/<id>`
 - `POST /api/shows/<id>/play` renders every lane and starts them together; `POST /api/shows/<id>/stop`
 
@@ -326,11 +326,11 @@ Health check endpoint for monitoring.
 
 ## GIF Processing
 
-GIFs are stored once in the library. When a show plays, each lane's GIFs are rendered for that display:
+GIFs and PNGs are stored once in the library. When a show plays, each lane's images are rendered for that display (a still gets the whole per-frame budget, so it comes out larger than a GIF frame):
 1. Each frame is converted to RGBA and composited onto black, cropped to the visible content
 2. **Color (RGB332)**: scaled to fit 240×320 within a per-frame pixel budget, so the whole lane fits the ST7735's RAM cache. The ST7735 then draws each frame at the largest whole-number scale that fits the screen (nearest neighbour), centered, so small frames still fill it
 3. **Monochrome**: 1-bit, dithered, packed MSB first (128×64), with the top 16 rows left black for the dancing text
-4. At most `MAX_FRAMES` frames are read from each GIF
+4. At most `MAX_FRAMES` frames are read from each GIF or animated PNG
 
 Rendered frames live in `devices.json`. Saved shows are in `shows.json` and the original GIFs in `gifs/`.
 

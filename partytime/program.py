@@ -84,7 +84,7 @@ def merge_delays(delays, picked):
 def build_animation(steps, sources):
     """
     Render a lane. steps is a list of (gif_id, duration_ms), with gif_id WAIT
-    for a wait, an Effect or a Text; sources maps gif id to GifSource.
+    for a wait, an Effect or a Text; sources maps gif id to ImageSource.
 
     Returns (animation, notes). animation holds the rendered frames and
     timeline in the shape of a device's animation record, minus the fields that

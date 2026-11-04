@@ -1,4 +1,4 @@
-"""The GIF library: uploaded GIFs kept on disk so shows can reuse them."""
+"""The image library: uploaded GIFs and PNGs kept on disk so shows can reuse them."""
 
 import hashlib
 import os
@@ -6,7 +6,7 @@ import time
 from threading import RLock
 
 from . import config
-from .media.gif import GifError, read_gif
+from .media.image import ImageError, read_image
 from .storage import load_json, save_json
 
 
@@ -26,6 +26,8 @@ class GifLibrary:
         self.entries = load_json(self.index_path, {})
 
     def _gif_path(self, gif_id):
+        # The extension doesn't matter (the format is read from the bytes); the
+        # name is kept from when the library only held GIFs.
         return os.path.join(self.directory, f"{gif_id}.gif")
 
     def list(self):
@@ -49,7 +51,7 @@ class GifLibrary:
     def add(self, raw, filename, source=None):
         """
         Store a GIF and return its entry. Adding the same bytes again returns
-        the existing entry. Raises GifError if it isn't a usable GIF.
+        the existing entry. Raises ImageError if it isn't a usable image.
         """
         gif_id = hashlib.sha1(raw).hexdigest()[:12]
 
@@ -57,12 +59,13 @@ class GifLibrary:
             if gif_id in self.entries:
                 return self.entries[gif_id]
 
-        source = source or read_gif(raw)
+        source = source or read_image(raw)
 
         name = os.path.splitext(os.path.basename(filename or ""))[0].strip()
         entry = {
             "id": gif_id,
-            "name": name[:config.MAX_NAME_LENGTH] or "GIF",
+            "name": name[:config.MAX_NAME_LENGTH] or "Image",
+            "format": source.format,
             "size": len(raw),
             "frame_count": len(source.frames),
             "duration_ms": source.duration_ms,
@@ -82,13 +85,13 @@ class GifLibrary:
         return entry
 
     def load_source(self, gif_id):
-        """Decode a stored GIF. Raises GifError if it is missing or unreadable."""
+        """Decode a stored image. Raises ImageError if it is missing or unreadable."""
         path = self.file_path(gif_id)
         if not path or not os.path.exists(path):
-            raise GifError(f"GIF {gif_id} is not in the library")
+            raise ImageError(f"Image {gif_id} is not in the library")
 
         with open(path, "rb") as f:
-            return read_gif(f.read())
+            return read_image(f.read())
 
     def delete(self, gif_id):
         """Remove a GIF. Returns False if it wasn't there."""
