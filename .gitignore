@@ -46,6 +46,9 @@ env/
 # ESP32 secrets
 secrets.h
 
+# Device registry
+devices.json
+
 # Logs
 *.log
 

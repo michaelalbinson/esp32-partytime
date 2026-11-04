@@ -1,21 +1,27 @@
-# ESP32 OLED Message Display
+# ESP32 Multi-Display Message System
 
-A Mac-hosted Flask web server that lets you publish text or GIF animations to an Elegoo ESP32, which displays them on a 128×64 SSD1306 OLED screen.
+A Mac-hosted Flask web server that lets you publish text or GIF animations to multiple ESP32 devices with different display types (OLED, TFT, dot matrix).
 
 ## Features
 
-- **Text messaging**: Send text messages (up to 300 characters) from a web interface to the ESP32
-- **GIF animation support**: Upload GIFs that are converted server-side to 1-bit monochrome frames for the OLED
-- **Real-time polling**: ESP32 polls the server every 2 seconds for updates
+- **Multi-device support**: Manage multiple ESP32 devices independently
+- **Text messaging**: Send text messages (up to 300 characters) to specific devices
+- **GIF animation support**: Upload GIFs converted server-side to appropriate formats for each display
+- **Auto-registration**: Devices automatically register when they first connect
+- **Real-time polling**: ESP32 devices poll the server every 2 seconds for updates
+- **Device management UI**: Web interface to view, edit, and delete devices
+- **Multiple display types**: Supports SSD1306 OLED, ST7735 TFT, and 7219MAX dot matrix displays
 - **Dark mode web interface**: Clean, responsive UI for publishing messages and animations
 
-## Hardware
+## Supported Hardware
 
-- **Board**: Elegoo ESP32 (model ESP-EL-SM-012)
-- **Display**: 128×64 I²C SSD1306 OLED
-- **I²C Wiring**:
-  - SDA: GPIO 21
-  - SCL: GPIO 22
+### Displays
+- **SSD1306**: 128×64 monochrome OLED (I²C)
+- **ST7735**: 240×320 color TFT (SPI)
+- **7219MAX**: 32×8 dot matrix (SPI)
+
+### Board
+- Elegoo ESP32 (model ESP-EL-SM-012) or equivalent
 
 ## Software Requirements
 
@@ -29,13 +35,7 @@ A Mac-hosted Flask web server that lets you publish text or GIF animations to an
 
 ### ESP32
 - Arduino IDE
-- Required libraries:
-  - `WiFi.h`
-  - `HTTPClient.h`
-  - `Wire.h`
-  - `Adafruit_GFX.h`
-  - `Adafruit_SSD1306.h`
-  - `Arduino_JSON.h`
+- Required libraries (varies by display type - see sketch/README.md)
 
 ## Setup
 
@@ -64,33 +64,25 @@ The server will start on `http://0.0.0.0:5050`, accessible from your local netwo
 
 ### 2. ESP32 Setup
 
-The ESP32 sketch is located in `sketch/esp-ssd1306.ino`.
+Choose the appropriate sketch from the `sketch/` directory based on your display type:
+- `sketch/esp-ssd1306/` for OLED displays
+- `sketch/esp-st7735/` for TFT displays
+- `sketch/esp-7219max/` for dot matrix displays
 
-**Before uploading**, you must configure the Wi-Fi and server settings. You have two options:
+**Before uploading**, configure each device:
 
-**Option 1: Edit the sketch directly (simpler)**
-Edit `sketch/esp-ssd1306.ino` and update:
-- `WIFI_SSID`: Your Wi-Fi network name
-- `WIFI_PASSWORD`: Your Wi-Fi password
-- `SERVER_IP`: The IP address of your Mac (where the Flask server is running)
+1. Copy the `secrets.h.example` file in the sketch directory to `secrets.h`
+2. Fill in your credentials:
+   ```cpp
+   const char* WIFI_SSID = "YourNetworkName";
+   const char* WIFI_PASSWORD = "YourPassword";
+   const char* SERVER_IP = "192.168.1.183";  // Your Mac's IP
+   const char* DEVICE_NAME = "living-room";  // Unique device name
+   ```
+3. **Important**: Each ESP32 must have a unique `DEVICE_NAME`
+4. Upload the sketch to your ESP32
 
-**Option 2: Use a secrets file (recommended for security)**
-1. Copy `sketch/secrets.h.example` to `sketch/secrets.h`
-2. Fill in your credentials in `secrets.h`
-3. Add `#include "secrets.h"` at the top of `esp-ssd1306.ino`
-4. Remove or comment out the hardcoded credentials in the sketch
-
-**Upload steps**:
-1. Open the Arduino IDE
-2. Install required libraries via Library Manager:
-   - WiFi
-   - Adafruit GFX Library
-   - Adafruit SSD1306
-   - ArduinoJson
-3. Select your board (Elegoo ESP32 or equivalent)
-4. Open `sketch/esp-ssd1306.ino`
-5. Configure your credentials (using either option above)
-6. Upload to your ESP32
+See `sketch/README.md` for detailed hardware connections and library requirements.
 
 ## Configuration
 
@@ -104,24 +96,62 @@ The server can be configured via environment variables. Copy `.env.example` to `
 - `DEVICE_TIMEOUT_SECONDS`: Time before device is considered offline (default: `10`)
 - `LOG_LEVEL`: Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, default: `INFO`)
 
+## Web Interface
+
+### Main Page (`/`)
+- Select a device from the dropdown
+- Publish text messages to the selected device
+- Upload GIF animations for the selected device
+- View device connection status
+
+### Device Management (`/devices`)
+- View all registered devices with online/offline status
+- See screen type and last seen time for each device
+- Click "Edit Message" to jump to the message editor for a specific device
+- Delete devices (use with caution - this removes all data for that device)
+
 ## API Endpoints
 
-### `GET /`
-Returns the web interface for publishing messages and uploading GIFs.
+### Device Management
 
-### `GET /health`
-Health check endpoint for monitoring.
+#### `GET /api/devices`
+List all registered devices.
 
 **Response**:
 ```json
 {
-  "status": "ok",
-  "timestamp": "2026-11-02T11:00:00.000000"
+  "devices": [
+    {
+      "name": "living-room",
+      "screen_type": "ssd1306",
+      "last_seen": "2026-11-02T11:00:00.000000",
+      "online": true
+    }
+  ]
 }
 ```
 
-### `GET /api/message?device_id=<id>`
-Returns the current message JSON.
+#### `GET /api/devices/<name>`
+Get detailed info for a specific device.
+
+#### `POST /api/devices`
+Manually create a new device.
+
+**Request body**:
+```json
+{
+  "name": "kitchen",
+  "screen_type": "st7735"
+}
+```
+
+#### `DELETE /api/devices/<name>`
+Delete a device.
+
+### Message Endpoints
+
+#### `GET /api/message?device=<name>&screen=<type>`
+Returns the current message for the specified device. If `device` is not provided, defaults to "default".
 
 **Response**:
 ```json
@@ -131,8 +161,8 @@ Returns the current message JSON.
 }
 ```
 
-### `POST /api/message`
-Publish a new text message.
+#### `POST /api/message?device=<name>`
+Publish a new text message to the specified device.
 
 **Request body**:
 ```json
@@ -154,24 +184,10 @@ Publish a new text message.
 - Cannot be empty
 - Maximum 300 characters
 
-### `GET /api/status`
-Returns the current message and device connection status.
+### Animation Endpoints
 
-**Response**:
-```json
-{
-  "message": {
-    "text": "Hello from your Mac!",
-    "version": 1
-  },
-  "device_seen": true
-}
-```
-
-- `device_seen` is `true` if the ESP32 has polled the server within the last 10 seconds (configurable via `DEVICE_TIMEOUT_SECONDS`)
-
-### `POST /api/animation`
-Upload a GIF for animation.
+#### `POST /api/animation?device=<name>`
+Upload a GIF for animation for the specified device.
 
 **Request**: `multipart/form-data` with a `gif` field containing the GIF file.
 
@@ -188,8 +204,8 @@ Upload a GIF for animation.
 }
 ```
 
-### `GET /api/animation`
-Returns animation metadata.
+#### `GET /api/animation?device=<name>`
+Returns animation metadata for the specified device.
 
 **Response**:
 ```json
@@ -200,14 +216,74 @@ Returns animation metadata.
 }
 ```
 
-- `frame_ms` is fixed at 120ms per frame (not the GIF's original frame delays)
+#### `GET /api/animation/frame/<index>?device=<name>`
+Returns a single monochrome animation frame as binary data (1,024 bytes, 128×64 pixels, 1-bit packed).
 
-### `GET /api/animation/frame/<index>`
-Returns a single animation frame as binary data.
+#### `GET /api/animation/rgb565?device=<name>`
+Returns color animation metadata for the specified device.
 
-**Response**: 1,024 bytes of packed 1-bit image data (128×64 pixels, 8 pixels per byte, MSB first)
+**Response**:
+```json
+{
+  "version": 1,
+  "frame_count": 24,
+  "frame_ms": 120,
+  "width": 128,
+  "height": 64,
+  "format": "rgb565-be",
+  "frame_bytes": 16384
+}
+```
 
-**Error**: 404 if frame index is out of range
+#### `GET /api/animation/rgb565/frame/<index>?device=<name>`
+Returns a single color animation frame as binary data (16,384 bytes, 128×64 pixels, RGB565 big-endian).
+
+#### `GET /api/animation/jpeg?device=<name>`
+Returns JPEG animation metadata for the specified device (optimized for ST7735 240×320 displays).
+
+**Response**:
+```json
+{
+  "version": 1,
+  "frame_count": 24,
+  "frame_ms": 120,
+  "width": 240,
+  "height": 320,
+  "format": "jpeg"
+}
+```
+
+#### `GET /api/animation/jpeg/frame/<index>?device=<name>`
+Returns a single JPEG animation frame as binary data (compressed, typically 5-20KB depending on content, 240×320 pixels).
+
+### Status & Health
+
+#### `GET /api/status?device=<name>`
+Returns the current message and device connection status.
+
+**Response**:
+```json
+{
+  "message": {
+    "text": "Hello from your Mac!",
+    "version": 1
+  },
+  "device_seen": true
+}
+```
+
+- `device_seen` is `true` if the device has polled the server within the last 10 seconds (configurable via `DEVICE_TIMEOUT_SECONDS`)
+
+#### `GET /health`
+Health check endpoint for monitoring.
+
+**Response**:
+```json
+{
+  "status": "ok",
+  "timestamp": "2026-11-02T11:00:00.000000"
+}
+```
 
 ## GIF Processing
 
@@ -215,42 +291,29 @@ When a GIF is uploaded:
 1. Each frame is converted to RGBA and composited onto a black background
 2. Frames are resized to fit within 128×64 while preserving aspect ratio
 3. Images are centered on the canvas
-4. Each frame is converted to 1-bit monochrome (grayscale threshold at 128)
-5. Pixels are packed row by row, 8 pixels per byte, MSB first
-6. Maximum 60 frames are processed (additional frames are ignored)
+4. Frames are converted to three formats:
+   - **Monochrome**: 1-bit (grayscale threshold at 128), packed row by row, 8 pixels per byte, MSB first
+   - **Color (RGB565)**: 128×64 RGB565 big-endian, 2 bytes per pixel
+   - **JPEG**: 240×320 JPEG (for ST7735 displays), compressed to save ESP32 RAM
+5. Maximum 60 frames are processed (additional frames are ignored)
 
-**Note**: Animations are stored in memory only and are lost when the server restarts.
+**Note**: Animations are stored in memory only and are lost when the server restarts. Device registry persists in `devices.json`.
 
-## ESP32 Implementation Notes
+## Multi-Device Architecture
 
-The provided sketch (`sketch/esp-ssd1306.ino`) implements the following logic:
+### Device Registration
+- Devices auto-register on their first poll to the server
+- Each device has independent message and animation state
+- Device registry persists in `devices.json`
 
-### Message Polling
-- Polls `/api/message` every 2 seconds with `device_id=esp32-demo`
-- Compares `version` field to detect changes
-- Displays text when `version` changes
-- Shows "Server: ONLINE/OFFLINE" status on the OLED
+### Backward Compatibility
+- Old API endpoints (`/api/message`, `/api/animation`) without device parameters default to the "default" device
+- This ensures existing single-device setups continue to work
 
-### Animation Polling
-- Polls `/api/animation` every 2 seconds
-- Compares `version` field to detect new animations
-- When a new animation is detected:
-  - Fetches each frame via `/api/animation/frame/<index>`
-  - Displays frames at the server-specified `frame_ms` interval (default 120ms)
-  - Loops the animation continuously
-- Animation display takes priority over text display when frames are available
-
-### I²C Configuration
-```cpp
-const int OLED_SDA = 21;
-const int OLED_SCL = 22;
-Wire.begin(OLED_SDA, OLED_SCL);
-```
-
-### Serial Debug
-- Uses `Serial.begin(115200)` for debugging
-- Outputs Wi-Fi connection status and ESP32 IP address
-- Monitor the Serial Monitor for connection issues
+### Screen Type Handling
+- Devices advertise their screen type via the `screen` query parameter
+- Different screen types may use different animation endpoints (e.g., ST7735 uses `/api/animation/rgb565`)
+- ESP32 sketches choose the appropriate endpoint based on their display type
 
 ## Troubleshooting
 
@@ -261,11 +324,19 @@ Wire.begin(OLED_SDA, OLED_SCL);
 - Verify Wi-Fi credentials in ESP32 sketch
 - Check the Serial Monitor (115200 baud) for connection errors
 - Confirm SERVER_IP in the sketch matches your Mac's IP address
+- Verify DEVICE_NAME is unique across all devices
+
+### Device not appearing in web UI
+- Ensure the ESP32 has successfully connected to Wi-Fi
+- Check the Serial Monitor for HTTP errors
+- Verify the device is polling with the correct device name
+- Check server logs for device registration errors
 
 ### GIF not displaying correctly
-- Ensure GIF is converted to 1-bit monochrome on the server
-- Check that frame packing matches ESP32's bitmap format
-- Verify I²C connection (SDA on GPIO 21, SCL on GPIO 22)
+- Ensure GIF is converted to the correct format for your display type
+- Check that frame packing matches your display's format
+- Verify hardware connections for your specific display type
+- For color displays, ensure you're using the RGB565 endpoint
 
 ### Arduino IDE not seeing the board
 - Check USB cable (data cables required, not charge-only)

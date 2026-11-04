@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Device Management</title>
+  <style>
+  :root {
+    color-scheme: dark;
+    font: 16px system-ui, sans-serif;
+    background: #111318;
+    color: #e8eaf0;
+  }
+
+  body {
+    max-width: 800px;
+    margin: 3rem auto;
+    padding: 0 1rem;
+  }
+
+  h1 {
+    margin-bottom: 2rem;
+  }
+
+  .device-list {
+    display: grid;
+    gap: 1rem;
+  }
+
+  .device-card {
+    border: 1px solid #454957;
+    border-radius: 8px;
+    padding: 1rem;
+    background: #1b1e26;
+  }
+
+  .device-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .device-name {
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+
+  .device-status {
+    display: inline-block;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .device-status.online {
+    background: #2d5a3d;
+    color: #7c9cff;
+  }
+
+  .device-status.offline {
+    background: #5a2d2d;
+    color: #ff7c7c;
+  }
+
+  .device-info {
+    color: #aab0bf;
+    font-size: 0.875rem;
+    margin-bottom: 1rem;
+  }
+
+  .device-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  button {
+    padding: 0.5rem 1rem;
+    border: 0;
+    border-radius: 6px;
+    background: #7c9cff;
+    color: #111318;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  button:hover {
+    background: #9ab1ff;
+  }
+
+  button.delete {
+    background: #ff7c7c;
+    color: #111318;
+  }
+
+  button.delete:hover {
+    background: #ff9e9e;
+  }
+
+  .no-devices {
+    text-align: center;
+    color: #aab0bf;
+    padding: 2rem;
+  }
+
+  .create-form {
+    margin-top: 2rem;
+    padding: 1rem;
+    border: 1px solid #454957;
+    border-radius: 8px;
+    background: #1b1e26;
+  }
+
+  .form-group {
+    margin-bottom: 1rem;
+  }
+
+  label {
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+
+  input, select {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid #454957;
+    border-radius: 6px;
+    background: #111318;
+    color: #e8eaf0;
+    font: inherit;
+    box-sizing: border-box;
+  }
+
+  .back-link {
+    display: inline-block;
+    margin-bottom: 1rem;
+    color: #7c9cff;
+    text-decoration: none;
+  }
+
+  .back-link:hover {
+    text-decoration: underline;
+  }
+</style>
+</head>
+<body>
+  <a href="/" class="back-link">← Back to message editor</a>
+  <h1>Device Management</h1>
+
+  <div id="device-list" class="device-list">
+    <p class="no-devices">Loading devices...</p>
+  </div>
+
+  <div class="create-form">
+    <h2>Create New Device</h2>
+    <form id="create-form">
+      <div class="form-group">
+        <label for="device-name">Device Name</label>
+        <input id="device-name" type="text" placeholder="e.g., living-room" required>
+      </div>
+      <div class="form-group">
+        <label for="screen-type">Screen Type</label>
+        <select id="screen-type">
+          <option value="ssd1306">SSD1306 (128×64 monochrome)</option>
+          <option value="st7735">ST7735 (240×320 color)</option>
+          <option value="7219max">7219MAX (dot matrix)</option>
+        </select>
+      </div>
+      <button type="submit">Create Device</button>
+    </form>
+  </div>
+
+  <script>
+    const deviceListEl = document.querySelector("#device-list");
+
+    async function loadDevices() {
+      try {
+        const response = await fetch("/api/devices");
+        const data = await response.json();
+        renderDevices(data.devices);
+      } catch (error) {
+        deviceListEl.innerHTML = `<p class="no-devices">Error loading devices: ${error.message}</p>`;
+      }
+    }
+
+    function renderDevices(devices) {
+      if (devices.length === 0) {
+        deviceListEl.innerHTML = `<p class="no-devices">No devices registered yet. Devices will auto-register when they connect.</p>`;
+        return;
+      }
+
+      deviceListEl.innerHTML = devices.map(device => `
+        <div class="device-card">
+          <div class="device-header">
+            <span class="device-name">${escapeHtml(device.name)}</span>
+            <span class="device-status ${device.online ? 'online' : 'offline'}">
+              ${device.online ? 'ONLINE' : 'OFFLINE'}
+            </span>
+          </div>
+          <div class="device-info">
+            Screen: ${escapeHtml(device.screen_type)} | Last seen: ${device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never'}
+          </div>
+          <div class="device-actions">
+            <button onclick="editDevice('${escapeHtml(device.name)}')">Edit Message</button>
+            <button onclick="deleteDevice('${escapeHtml(device.name)}')" class="delete">Delete</button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function editDevice(deviceName) {
+      window.location.href = `/?device=${encodeURIComponent(deviceName)}`;
+    }
+
+    async function deleteDevice(deviceName) {
+      if (!confirm(`Are you sure you want to delete device "${deviceName}"?`)) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(deviceName)}`, {
+          method: 'DELETE'
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Delete failed');
+        }
+        loadDevices();
+      } catch (error) {
+        alert(`Could not delete device: ${error.message}`);
+      }
+    }
+
+    document.querySelector("#create-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const name = document.querySelector("#device-name").value.trim();
+      const screenType = document.querySelector("#screen-type").value;
+
+      if (!name) {
+        alert("Please enter a device name");
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/devices", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, screen_type: screenType })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Create failed');
+        }
+        document.querySelector("#device-name").value = "";
+        loadDevices();
+      } catch (error) {
+        alert(`Could not create device: ${error.message}`);
+      }
+    });
+
+    loadDevices();
+    setInterval(loadDevices, 5000);
+  </script>
+</body>
+</html>

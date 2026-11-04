@@ -18,6 +18,37 @@
     padding: 0 1rem;
   }
 
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+
+  .device-selector {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  select {
+    padding: 0.5rem;
+    border: 1px solid #454957;
+    border-radius: 6px;
+    background: #1b1e26;
+    color: #e8eaf0;
+    font: inherit;
+  }
+
+  .devices-link {
+    color: #7c9cff;
+    text-decoration: none;
+  }
+
+  .devices-link:hover {
+    text-decoration: underline;
+  }
+
   textarea {
     box-sizing: border-box;
     width: 100%;
@@ -62,7 +93,15 @@
 </style>
 </head>
 <body>
-  <h1>ESP32 Message</h1>
+  <div class="header">
+    <h1>ESP32 Message</h1>
+    <div class="device-selector">
+      <select id="device-select">
+        <option value="default">Default</option>
+      </select>
+      <a href="/devices" class="devices-link">Manage Devices</a>
+    </div>
+  </div>
   <p id="status">Checking ESP32…</p>
   <form id="form">
     <label for="text">Display message</label>
@@ -81,10 +120,49 @@
     const statusEl = document.querySelector("#status");
     const textEl = document.querySelector("#text");
     const resultEl = document.querySelector("#result");
+    const deviceSelect = document.querySelector("#device-select");
+
+    let currentDevice = "default";
+
+    // Get device from URL param
+    const urlParams = new URLSearchParams(window.location.search);
+    const deviceParam = urlParams.get("device");
+    if (deviceParam) {
+      currentDevice = deviceParam;
+    }
+
+    async function loadDevices() {
+      try {
+        const response = await fetch("/api/devices");
+        const data = await response.json();
+        deviceSelect.innerHTML = '<option value="default">Default</option>' +
+          data.devices.map(d => `<option value="${escapeHtml(d.name)}" ${d.name === currentDevice ? 'selected' : ''}>${escapeHtml(d.name)}</option>`).join('');
+      } catch (error) {
+        console.error("Failed to load devices:", error);
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    deviceSelect.addEventListener("change", () => {
+      currentDevice = deviceSelect.value;
+      const url = new URL(window.location);
+      if (currentDevice === "default") {
+        url.searchParams.delete("device");
+      } else {
+        url.searchParams.set("device", currentDevice);
+      }
+      window.history.replaceState({}, "", url);
+      refreshStatus();
+    });
 
     async function refreshStatus() {
       try {
-        const response = await fetch("/api/status");
+        const response = await fetch(`/api/status?device=${encodeURIComponent(currentDevice)}`);
         const status = await response.json();
         statusEl.textContent = status.device_seen
           ? "ESP32: recently connected"
@@ -100,7 +178,7 @@
     document.querySelector("#form").addEventListener("submit", async (event) => {
       event.preventDefault();
       try {
-        const response = await fetch("/api/message", {
+        const response = await fetch(`/api/message?device=${encodeURIComponent(currentDevice)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: textEl.value })
@@ -113,9 +191,6 @@
         resultEl.textContent = "Could not publish: " + error.message;
       }
     });
-
-    refreshStatus();
-    setInterval(refreshStatus, 2000);
 
 const gifResult = document.querySelector("#gif-result");
 
@@ -133,7 +208,7 @@ document.querySelector("#gif-form").addEventListener("submit", async (event) => 
 
   try {
     gifResult.textContent = "Uploading…";
-    const response = await fetch("/api/animation", {
+    const response = await fetch(`/api/animation?device=${encodeURIComponent(currentDevice)}`, {
       method: "POST",
       body: formData
     });
@@ -146,6 +221,11 @@ document.querySelector("#gif-form").addEventListener("submit", async (event) => 
     gifResult.textContent = "Could not upload: " + error.message;
   }
 });
+
+    loadDevices();
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+    setInterval(loadDevices, 10000);
   </script>
 </body>
 </html>
