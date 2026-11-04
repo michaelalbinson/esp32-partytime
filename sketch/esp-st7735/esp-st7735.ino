@@ -64,6 +64,10 @@ unsigned long nextFrameAt = 0;   // millis() deadline to draw the buffered frame
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
 
+// Timing/heap stats for the frame being played, logged once it is drawn.
+unsigned long lastFetchMs = 0;
+unsigned long lastFetchDoneAt = 0;
+
 void drawTextScreen() {
   if (animationActive) {
     return;
@@ -469,7 +473,10 @@ void loop() {
     // Prefetch the next frame as soon as the previous one is on screen.
     if (!frameReady && now - lastFrameFetch >= FRAME_RETRY_MS) {
       lastFrameFetch = now;
+      unsigned long fetchStart = millis();
       frameReady = fetchFrame(animationFrameIndex);
+      lastFetchMs = millis() - fetchStart;
+      lastFetchDoneAt = millis();
     }
 
     now = millis();
@@ -479,7 +486,20 @@ void loop() {
       animationFrameCount > 0 &&
       frameReady &&
       (long)(now - nextFrameAt) >= 0) {
+    unsigned long drawStart = millis();
     bool drawn = drawFrame();
+    unsigned long drawMs = millis() - drawStart;
+
+    // frame=index  delay=GIF delay  fetch=download time  wait=time the frame
+    // sat ready before its deadline (negative: drew late)  draw=SPI time.
+    Serial.printf("frame=%d delay=%lu fetch=%lu wait=%ld draw=%lu heap=%u maxblk=%u\n",
+                  animationFrameIndex,
+                  delayForFrame(animationFrameIndex),
+                  lastFetchMs,
+                  (long)(nextFrameAt - lastFetchDoneAt),
+                  drawMs,
+                  (unsigned int)ESP.getFreeHeap(),
+                  (unsigned int)ESP.getMaxAllocHeap());
     frameReady = false;
     lastFrameFetch = 0;
 
