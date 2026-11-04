@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../esp-st7735/netlink.h"
 #include "../esp-st7735/timeline.h"
 
 static int failures = 0;
@@ -121,6 +122,74 @@ int main() {
   TlClock wrap = {false, 0};
   tlSync(tl, wrap, 0xFFFFFF00u, 100, true);
   CHECK(tlPosition(tl, wrap, 0xFFFFFF00u + 300) == 400);
+
+  // ---- Mailbox: the network task posts, the drawing loop takes ----------------
+  static NetAnimBox box;
+  static NetAnimTaken got;
+  static Timeline live;
+  memset(&box, 0, sizeof box);
+  tlClear(live);
+
+  CHECK(!netTakeAnim(box, got, live));  // nothing pending
+
+  // A sync on its own comes through without touching the program.
+  netPostSync(box, 3, 1000, 250, false);
+  live.cycleMs = 777;
+  CHECK(netTakeAnim(box, got, live));
+  CHECK(!got.programChanged && got.hasSync && got.refMs == 1000 && got.positionMs == 250);
+  CHECK(live.cycleMs == 777);            // not overwritten
+  CHECK(!netTakeAnim(box, got, live));   // taking empties the box
+
+  // A program followed by a sync before it is taken arrives as one update.
+  Timeline fresh = makeTimeline();
+  netPostProgram(box, 4, fresh);
+  netPostSync(box, 4, 2000, 900, false);
+  CHECK(netTakeAnim(box, got, live));
+  CHECK(got.programChanged && got.version == 4 && got.hasSync && got.positionMs == 900);
+  CHECK(live.cycleMs == 5000 && live.stepCount == 3);
+
+  // A newer program replaces an untaken one, and discards its stale sync.
+  Timeline other = makeTimeline();
+  other.cycleMs = 1234;
+  netPostProgram(box, 5, fresh);
+  netPostSync(box, 5, 3000, 100, true);
+  netPostProgram(box, 6, other);
+  CHECK(netTakeAnim(box, got, live));
+  CHECK(got.version == 6 && got.programChanged && !got.hasSync && !got.forceSync);
+  CHECK(live.cycleMs == 1234);
+
+  // Forcing a sync is sticky until taken.
+  netPostSync(box, 6, 10, 20, true);
+  netPostSync(box, 6, 30, 40, false);
+  CHECK(netTakeAnim(box, got, live));
+  CHECK(got.forceSync && got.refMs == 30 && got.positionMs == 40);
+
+  // Messages: the latest wins; a failed poll keeps the last text.
+  static NetMessageBox mbox;
+  static NetMessageTaken msg;
+  memset(&mbox, 0, sizeof mbox);
+  CHECK(!netTakeMessage(mbox, msg));
+
+  netPostMessage(mbox, "first", 1, true);
+  netPostMessage(mbox, "second", 2, true);
+  CHECK(netTakeMessage(mbox, msg));
+  CHECK(msg.hasText && strcmp(msg.text, "second") == 0 && msg.version == 2 && msg.online);
+
+  netPostMessage(mbox, nullptr, 0, false);  // server unreachable
+  CHECK(netTakeMessage(mbox, msg));
+  CHECK(!msg.hasText && !msg.online);
+
+  netPostMessage(mbox, "kept", 3, true);
+  netPostMessage(mbox, nullptr, 0, false);
+  CHECK(netTakeMessage(mbox, msg));
+  CHECK(msg.hasText && strcmp(msg.text, "kept") == 0 && !msg.online);
+
+  char longText[400];
+  memset(longText, 'x', sizeof longText);
+  longText[399] = '\0';
+  netPostMessage(mbox, longText, 4, true);
+  CHECK(netTakeMessage(mbox, msg));
+  CHECK(strlen(msg.text) == NET_MESSAGE_LEN - 1);
 
   if (failures) {
     printf("%d failure(s)\n", failures);

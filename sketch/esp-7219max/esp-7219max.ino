@@ -5,6 +5,7 @@
 #include <MD_MAX72xx.h>
 #include <secrets.h>
 #include "timeline.h"
+#include "netlink.h"
 
 #define MATRIX_HARDWARE MD_MAX72XX::FC16_HW
 #define MATRIX_DEVICES 4
@@ -21,7 +22,19 @@ MD_MAX72XX matrix(MATRIX_HARDWARE, MATRIX_CS, MATRIX_DEVICES);
 // What the server told us to play (see timeline.h), and our clock against it.
 Timeline timeline;
 TlClock clock_;
-int animationVersion = -1;
+int animationVersion = -1;  // the version the drawing loop is playing
+
+// ---- Network task ----------------------------------------------------------
+// All HTTP polling runs in a task on the other core so a slow request can't
+// stall drawing. The task posts what it learns into this box (netMutex guards
+// it); the drawing loop takes it when it suits and owns `timeline`. The task
+// never touches the matrix. (Frame downloads still happen in the drawing loop.)
+SemaphoreHandle_t netMutex;
+NetAnimBox animBox;
+
+// Only the network task uses these.
+Timeline netStaging;
+int netVersion = -1;
 
 // Playback: "target" is what to draw next, at changeAt (device millis). Its
 // frame is fetched ahead of time, so network latency only matters if a fetch
@@ -33,7 +46,6 @@ unsigned long changeAt = 0;
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
 uint8_t frameBitmap[SOURCE_BYTES];
-unsigned long lastAnimationCheck = 0;
 
 // What is on the matrix. There is no text screen: a wait just clears it.
 enum ScreenMode { SCREEN_BLANK, SCREEN_GIF, SCREEN_EFFECT, SCREEN_TEXT };
@@ -67,8 +79,12 @@ void showMatrixFrame(const uint8_t* bitmap) {
   }
 }
 
-// Ask the server what to play. Returns false if it couldn't be reached.
-bool checkAnimation() {
+// ---- Network task ------------------------------------------------------------
+// Everything here may block on the network. None of it touches the matrix.
+
+// Ask the server what to play and post the answer. Returns false if it
+// couldn't be reached.
+bool netPollAnimation() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClient client;
@@ -95,37 +111,50 @@ bool checkAnimation() {
 
   int newVersion = (int)info["version"];
 
-  if (newVersion != animationVersion) {
-    animationVersion = newVersion;
-    haveTarget = false;
-    targetReady = false;
-    clock_.synced = false;
+  if (newVersion != netVersion) {
+    netVersion = newVersion;
 
-    if (!tlLoadJson(timeline, info)) {
+    if (!tlLoadJson(netStaging, info)) {
       Serial.println("Bad program, ignoring it");
-      tlClear(timeline);
+      tlClear(netStaging);
     }
 
-    // Clear whatever was playing.
-    screenMode = SCREEN_BLANK;
-    shownFrame = -1;
-    shownEffect = TL_EFFECT_NONE;
-    shownText = -1;
-    shownStyle = TL_STYLE_NONE;
-    matrix.clear();
+    NetLock lock;
+    netPostProgram(animBox, newVersion, netStaging);
   }
 
-  if (tlActive(timeline)) {
+  if (tlActive(netStaging)) {
     uint32_t position = (uint32_t)(int)info["program"]["position_ms"];
     unsigned long midpoint = sentAt + (receivedAt - sentAt) / 2;
 
-    if (tlSync(timeline, clock_, midpoint, position, false)) {
-      haveTarget = false;
-      targetReady = false;
-    }
+    NetLock lock;
+    netPostSync(animBox, netVersion, midpoint, position, false);
   }
 
   return true;
+}
+
+void netTask(void *) {
+  bool polledOnce = false;
+  unsigned long lastCheck = 0;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    unsigned long now = millis();
+
+    if (!polledOnce || now - lastCheck >= ANIMATION_CHECK_MS) {
+      polledOnce = true;
+      lastCheck = now;
+      netPollAnimation();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 // Download a frame into frameBitmap without drawing it.
@@ -638,6 +667,42 @@ void playTimeline() {
   else if (screenMode == SCREEN_TEXT) tickText();
 }
 
+// Apply what the network task found (drawing loop).
+void applyNetwork() {
+  NetAnimTaken update;
+  bool gotUpdate;
+  {
+    NetLock lock;
+    gotUpdate = netTakeAnim(animBox, update, timeline);
+  }
+
+  if (!gotUpdate) return;
+
+  if (update.programChanged) {
+    animationVersion = update.version;
+    haveTarget = false;
+    targetReady = false;
+    clock_.synced = false;
+
+    // Clear whatever was playing.
+    screenMode = SCREEN_BLANK;
+    shownFrame = -1;
+    shownEffect = TL_EFFECT_NONE;
+    shownText = -1;
+    shownStyle = TL_STYLE_NONE;
+    matrix.clear();
+  } else if (update.version != animationVersion) {
+    return;  // sync for a program we haven't taken
+  }
+
+  if (update.hasSync && tlActive(timeline)) {
+    if (tlSync(timeline, clock_, update.refMs, update.positionMs, update.forceSync)) {
+      haveTarget = false;
+      targetReady = false;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -667,21 +732,15 @@ void setup() {
   matrix.clear();
   tlClear(timeline);
   clock_.synced = false;
+
+  // From here on the network task does the polling and reconnecting. It runs on
+  // core 0 (with the WiFi stack); loop() stays on core 1 and only draws.
+  netMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTask, "net", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(500);
-    return;
-  }
-
-  unsigned long now = millis();
-
-  if (now - lastAnimationCheck >= ANIMATION_CHECK_MS) {
-    lastAnimationCheck = now;
-    checkAnimation();
-  }
+  applyNetwork();
 
   if (tlActive(timeline)) playTimeline();
 

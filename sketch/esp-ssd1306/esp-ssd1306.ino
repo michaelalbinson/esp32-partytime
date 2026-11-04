@@ -6,6 +6,7 @@
 #include <Arduino_JSON.h>
 #include <secrets.h>
 #include "timeline.h"
+#include "netlink.h"
 
 const int OLED_SDA = 21;
 const int OLED_SCL = 22;
@@ -14,7 +15,21 @@ const unsigned long POLL_INTERVAL_MS = 2000;
 // What the server told us to play (see timeline.h), and our clock against it.
 Timeline timeline;
 TlClock clock_;
-int animationVersion = -1;
+int animationVersion = -1;  // the version the drawing loop is playing
+
+// ---- Network task ----------------------------------------------------------
+// All HTTP polling runs in a task on the other core so a slow request can't
+// stall drawing. The task posts what it learns into these boxes (netMutex
+// guards them); the drawing loop takes it when it suits and owns `timeline`.
+// The task never touches the display. (Frame downloads still happen in the
+// drawing loop.)
+SemaphoreHandle_t netMutex;
+NetAnimBox animBox;
+NetMessageBox messageBox;
+
+// Only the network task uses these.
+Timeline netStaging;
+int netVersion = -1;
 
 // Playback: "target" is what to draw next, at changeAt (device millis). Its
 // frame is fetched ahead of time, so network latency only matters if a fetch
@@ -26,7 +41,6 @@ unsigned long changeAt = 0;
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
 uint8_t frameBitmap[1024];
-unsigned long lastAnimationCheck = 0;
 
 // What is on screen. Message text is only drawn in text mode, so it never
 // overwrites a GIF or an effect.
@@ -62,10 +76,13 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 String currentText = "";
 String currentVersion = "";
 bool serverOnline = false;
-unsigned long lastPoll = 0;
 
-// Ask the server what to play. Returns false if it couldn't be reached.
-bool checkAnimation() {
+// ---- Network task ------------------------------------------------------------
+// Everything here may block on the network. None of it touches the display.
+
+// Ask the server what to play and post the answer. Returns false if it
+// couldn't be reached.
+bool netPollAnimation() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClient client;
@@ -95,36 +112,80 @@ bool checkAnimation() {
 
   int newVersion = (int)info["version"];
 
-  if (newVersion != animationVersion) {
-    animationVersion = newVersion;
-    haveTarget = false;
-    targetReady = false;
-    clock_.synced = false;
+  if (newVersion != netVersion) {
+    netVersion = newVersion;
 
-    if (!tlLoadJson(timeline, info)) {
+    if (!tlLoadJson(netStaging, info)) {
       Serial.println("Bad program, ignoring it");
-      tlClear(timeline);
+      tlClear(netStaging);
     }
 
     Serial.printf("Animation updated to version %d: %d steps, %d frames, cycle %lu ms\n",
-                  newVersion, timeline.stepCount, timeline.frameCount,
-                  (unsigned long)timeline.cycleMs);
+                  newVersion, netStaging.stepCount, netStaging.frameCount,
+                  (unsigned long)netStaging.cycleMs);
 
-    // Clear whatever was playing and show the message again.
-    enterTextMode();
+    NetLock lock;
+    netPostProgram(animBox, newVersion, netStaging);
   }
 
-  if (tlActive(timeline)) {
+  if (tlActive(netStaging)) {
     uint32_t position = (uint32_t)(int)info["program"]["position_ms"];
     unsigned long midpoint = sentAt + (receivedAt - sentAt) / 2;
 
-    if (tlSync(timeline, clock_, midpoint, position, false)) {
-      haveTarget = false;
-      targetReady = false;
-    }
+    NetLock lock;
+    netPostSync(animBox, netVersion, midpoint, position, false);
   }
 
   return true;
+}
+
+void netPollMessage() {
+  String text;
+  int version = 0;
+  bool haveText = false;
+  bool online = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+    String url = String("http://") + SERVER_IP + ":5050/api/message?device=" + DEVICE_NAME + "&screen=ssd1306";
+
+    if (http.begin(client, url)) {
+      if (http.GET() == HTTP_CODE_OK) {
+        JSONVar doc = JSON.parse(http.getString());
+
+        if (JSON.typeof(doc) != "undefined") {
+          text = (const char*)doc["text"];
+          version = (int)doc["version"];
+          haveText = true;
+          online = true;
+        }
+      }
+
+      http.end();
+    }
+  }
+
+  NetLock lock;
+  netPostMessage(messageBox, haveText ? text.c_str() : nullptr, version, online);
+}
+
+void netTask(void *) {
+  bool polledOnce = false;
+  unsigned long lastPoll = 0;
+
+  for (;;) {
+    unsigned long now = millis();
+
+    if (!polledOnce || now - lastPoll >= POLL_INTERVAL_MS) {
+      polledOnce = true;
+      lastPoll = now;
+      netPollMessage();
+      netPollAnimation();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 // Download frame number index of the lane into frameBitmap without drawing it.
@@ -804,50 +865,58 @@ void playTimeline() {
   if (screenMode == SCREEN_GIF) danceTick();
 }
 
-void pollServer() {
-  if (WiFi.status() != WL_CONNECTED) {
-    serverOnline = false;
-    refreshText();
-    return;
+// Apply what the network task found (drawing loop).
+void applyNetwork() {
+  NetMessageTaken message;
+  bool gotMessage;
+  {
+    NetLock lock;
+    gotMessage = netTakeMessage(messageBox, message);
   }
 
-  WiFiClient client;
-  HTTPClient http;
+  if (gotMessage) {
+    bool changed = message.online != serverOnline;
+    serverOnline = message.online;
 
-  String url = String("http://") + SERVER_IP + ":5050/api/message?device=" + DEVICE_NAME + "&screen=ssd1306";
-
-  if (!http.begin(client, url)) {
-    serverOnline = false;
-    refreshText();
-    return;
-  }
-
-  int code = http.GET();
-
-  if (code == HTTP_CODE_OK) {
-    String response = http.getString();
-    JSONVar doc = JSON.parse(response);
-
-    if (JSON.typeof(doc) != "undefined") {
-      String newText = (const char*)doc["text"];
-      String newVersion = JSON.stringify(doc["version"]);
-
-      serverOnline = true;
-      if (newText != currentText || newVersion != currentVersion) {
-        currentText = newText;
+    if (message.hasText) {
+      String newVersion = String(message.version);
+      if (currentText != message.text || currentVersion != newVersion) {
+        currentText = message.text;
         currentVersion = newVersion;
-        refreshText();
+        changed = true;
       }
-    } else {
-      serverOnline = false;
-      refreshText();
     }
-  } else {
-    serverOnline = false;
-    refreshText();
+
+    if (changed) refreshText();
   }
 
-  http.end();
+  NetAnimTaken update;
+  bool gotUpdate;
+  {
+    NetLock lock;
+    gotUpdate = netTakeAnim(animBox, update, timeline);
+  }
+
+  if (!gotUpdate) return;
+
+  if (update.programChanged) {
+    animationVersion = update.version;
+    haveTarget = false;
+    targetReady = false;
+    clock_.synced = false;
+
+    // Clear whatever was playing and show the message again.
+    enterTextMode();
+  } else if (update.version != animationVersion) {
+    return;  // sync for a program we haven't taken
+  }
+
+  if (update.hasSync && tlActive(timeline)) {
+    if (tlSync(timeline, clock_, update.refMs, update.positionMs, update.forceSync)) {
+      haveTarget = false;
+      targetReady = false;
+    }
+  }
 }
 
 void setup() {
@@ -878,18 +947,15 @@ void setup() {
   tlClear(timeline);
   clock_.synced = false;
   drawScreen();
+
+  // From here on the network task does the polling. It runs on core 0 (with the
+  // WiFi stack); loop() stays on core 1 and only draws.
+  netMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTask, "net", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
-  if (millis() - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = millis();
-    pollServer();
-  }
-
-  if (millis() - lastAnimationCheck >= 2000) {
-    lastAnimationCheck = millis();
-    checkAnimation();
-  }
+  applyNetwork();
 
   if (tlActive(timeline)) playTimeline();
 

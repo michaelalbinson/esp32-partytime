@@ -8,6 +8,7 @@
 #include <Arduino_JSON.h>
 #include <secrets.h>
 #include "timeline.h"
+#include "netlink.h"
 
 // Display pins
 #define TFT_CS   5
@@ -47,7 +48,27 @@ void freeCanvas() {
 // What the server told us to play (see timeline.h), and our clock against it.
 Timeline timeline;
 TlClock clock_;
-int animationVersion = -1;
+int animationVersion = -1;  // the version the drawing loop is playing
+
+// ---- Network task ----------------------------------------------------------
+// All HTTP runs in a task on the other core so a slow request can't stall
+// drawing. The task posts what it learns into these boxes (netMutex guards
+// them, and loadState below); the drawing loop takes it when it suits. The
+// task never touches the display. The drawing loop owns `timeline` and the
+// frame cache, except while loadState is LOAD_LOADING, when the task fills
+// the cache and the drawing loop leaves both alone.
+SemaphoreHandle_t netMutex;
+NetAnimBox animBox;
+NetMessageBox messageBox;
+
+enum LoadState { LOAD_READY, LOAD_LOADING };
+LoadState loadState = LOAD_READY;  // guarded by netMutex
+int loadDone = 0;                  // frames cached so far; guarded by netMutex
+int loadTotal = 0;
+
+// Only the network task uses these.
+Timeline netStaging;
+int netVersion = -1;
 
 // Frames are stored as RGB332, one byte per pixel, in malloc'd buffers (see the
 // frame cache below). There is no static frame buffer, so that RAM stays free.
@@ -76,9 +97,8 @@ uint16_t pixelBuffer[MAX_STRIP_PIXELS];
 
 String currentText = "";
 bool serverOnline = false;
-unsigned long lastPoll = 0;
 
-// What is on screen. The message text is redrawn by pollServer() only while the
+// What is on screen. The message text is redrawn only while the
 // screen is in text mode, so it never overwrites a GIF or an effect.
 enum ScreenMode { SCREEN_TEXT, SCREEN_GIF, SCREEN_EFFECT, SCREEN_TEXTSTEP };
 ScreenMode screenMode = SCREEN_TEXT;
@@ -98,7 +118,6 @@ bool targetReady = false;
 unsigned long changeAt = 0;
 unsigned long lastFrameFetch = 0;
 const unsigned long FRAME_RETRY_MS = 250;
-bool needPreload = false;
 
 // Timing/heap stats for the last drawn frame, logged when it is drawn.
 unsigned long lastFetchMs = 0;
@@ -313,9 +332,9 @@ bool fetchFrame(int frameIndex, uint8_t *dest, size_t pixelCount) {
 }
 
 // Check the clips fit the pixel budget and the display.
-bool validateGeometry() {
-  for (int i = 0; i < timeline.clipCount; i++) {
-    const TlClip &c = timeline.clips[i];
+bool validateGeometry(const Timeline &tl) {
+  for (int i = 0; i < tl.clipCount; i++) {
+    const TlClip &c = tl.clips[i];
     size_t pixels = (size_t)c.width * (size_t)c.height;
 
     if (c.frameCount > 0 &&
@@ -337,9 +356,13 @@ void resetPlayback() {
   lastFrameFetch = 0;
 }
 
-// Ask the server what to play. forceSync adopts the server's position even if
-// we're only slightly off. Returns false if the server couldn't be reached.
-bool checkAnimation(bool forceSync = false) {
+// ---- Network task -----------------------------------------------------------
+// Everything here may block on the network. None of it touches the display.
+
+// Ask the server what to play and post the answer. forceSync adopts the
+// server's position even if we're only slightly off. Returns false if the
+// server couldn't be reached.
+bool netPollAnimation(bool forceSync) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
   }
@@ -379,73 +402,82 @@ bool checkAnimation(bool forceSync = false) {
 
   int newVersion = (int)info["version"];
 
-  if (newVersion != animationVersion) {
-    animationVersion = newVersion;
-    freeFrameCache();
-    resetPlayback();
-    clock_.synced = false;
+  if (newVersion != netVersion) {
+    netVersion = newVersion;
 
-    if (!tlLoadJson(timeline, info) || !validateGeometry()) {
+    if (!tlLoadJson(netStaging, info) || !validateGeometry(netStaging)) {
       Serial.println("Animation check: bad program, ignoring it");
-      tlClear(timeline);
+      tlClear(netStaging);
     }
 
     Serial.printf("Animation changed: version %d, %d steps, %d frames, cycle %lu ms\n",
-                  newVersion, timeline.stepCount, timeline.frameCount,
-                  (unsigned long)timeline.cycleMs);
+                  newVersion, netStaging.stepCount, netStaging.frameCount,
+                  (unsigned long)netStaging.cycleMs);
 
-    if (tlActive(timeline)) {
-      // Leave the old picture up while the new program loads (see
-      // preloadFrames); the new program's first draw replaces it. Forget what
-      // was shown so that draw can't be skipped as "already on screen".
-      freeCanvas();
-      screenMode = SCREEN_TEXT;
-      shownClip = -1;
-      shownFrame = -1;
-      shownEffect = TL_EFFECT_NONE;
-      shownStep = -1;
-      shownStyle = TL_STYLE_NONE;
-      textDirty = true;
-    } else {
-      // Nothing to play: clear the old content and show the message.
-      enterTextMode();
-    }
-
-    needPreload = tlActive(timeline) && timeline.frameCount > 0;
+    NetLock lock;
+    netPostProgram(animBox, newVersion, netStaging);
   }
 
-  if (tlActive(timeline)) {
-    JSONVar program = info["program"];
-    uint32_t position = (uint32_t)(int)program["position_ms"];
+  if (tlActive(netStaging)) {
+    uint32_t position = (uint32_t)(int)info["program"]["position_ms"];
 
     // The server stamped the position somewhere between our request and its
     // answer; the midpoint is the best guess for when.
     unsigned long midpoint = sentAt + (receivedAt - sentAt) / 2;
 
-    if (tlSync(timeline, clock_, midpoint, position, forceSync)) {
-      resetPlayback();
-    }
+    NetLock lock;
+    netPostSync(animBox, netVersion, midpoint, position, forceSync);
   }
 
   return true;
 }
 
-// Download every frame into the cache before starting, so playback never waits
-// on WiFi. Frames that don't fit the cache are streamed later.
-// Loading progress: a single pixel row along the top edge that grows left to
-// right. It is drawn over whatever is on screen (nothing starts that high) so
-// it doesn't interrupt anything.
-#define LOADING_BAR_HEIGHT 1
+void netPollMessage() {
+  const char *text = nullptr;
+  int version = 0;
+  bool online = false;
+  String textCopy;
 
-void drawLoadingBar(int done, int total) {
-  if (done > 0) {
-    display.fillRect(0, 0, (SCREEN_WIDTH * done) / total, LOADING_BAR_HEIGHT, ST77XX_GREEN);
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+
+    String url = String("http://") + SERVER_IP +
+                 ":5050/api/message?device=" + DEVICE_NAME +
+                 "&screen=st7735";
+
+    http.setTimeout(5000);
+
+    if (http.begin(client, url)) {
+      int code = http.GET();
+
+      if (code == HTTP_CODE_OK) {
+        JSONVar doc = JSON.parse(http.getString());
+
+        if (JSON.typeof(doc) != "undefined") {
+          textCopy = (const char *)doc["text"];
+          text = textCopy.c_str();
+          version = (int)doc["version"];
+          online = true;
+        } else {
+          Serial.println("Message poll: invalid JSON");
+        }
+      } else {
+        Serial.printf("Message poll: HTTP %d\n", code);
+      }
+
+      http.end();
+    }
   }
+
+  NetLock lock;
+  netPostMessage(messageBox, text, version, online);
 }
 
-void preloadFrames() {
-  drawLoadingBar(0, timeline.frameCount);
-
+// Download every frame into the cache before starting, so playback never waits
+// on WiFi. Frames that don't fit the cache are streamed later. Runs while
+// loadState is LOAD_LOADING, when this task owns the cache.
+void netPreloadFrames() {
   for (int f = 0; f < timeline.frameCount; f++) {
     int clipIndex = clipOfFrame(f);
     if (clipIndex < 0) continue;
@@ -463,26 +495,164 @@ void preloadFrames() {
       break;
     }
 
-    drawLoadingBar(f + 1, timeline.frameCount);
+    NetLock lock;
+    loadDone = f + 1;
   }
-
-  display.fillRect(0, 0, SCREEN_WIDTH, LOADING_BAR_HEIGHT, ST77XX_BLACK);
 
   Serial.printf("Preloaded %d of %d frames (%u bytes)\n",
                 cachedFrames, (int)timeline.frameCount, (unsigned int)cacheBytes);
+
+  // The clock moved on while we loaded: ask again, and post that before
+  // handing back so the drawing loop starts from the right place.
+  netPollAnimation(true);
+
+  NetLock lock;
+  loadState = LOAD_READY;
 }
 
-// Ask the server again after something slow (the preload) so the clock is
-// current, then forget any plan made against the old one.
-void refreshAnimation() {
-  if (!checkAnimation()) {
+void netTask(void *) {
+  bool polledOnce = false;
+  unsigned long lastPoll = 0;
+
+  for (;;) {
+    bool loading;
+    {
+      NetLock lock;
+      loading = loadState == LOAD_LOADING;
+    }
+
+    if (loading) {
+      netPreloadFrames();
+      continue;
+    }
+
+    unsigned long now = millis();
+
+    if (!polledOnce || now - lastPoll >= POLL_INTERVAL_MS) {
+      polledOnce = true;
+      lastPoll = now;
+      netPollMessage();
+      netPollAnimation(false);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// ---- Applying what the network task found (drawing loop) ----------------------
+
+// Loading progress: a single pixel row along the top edge that grows left to
+// right. It is drawn over whatever is on screen (nothing starts that high) so
+// it doesn't interrupt anything.
+#define LOADING_BAR_HEIGHT 1
+
+void drawLoadingBar(int done, int total) {
+  if (done > 0 && total > 0) {
+    display.fillRect(0, 0, (SCREEN_WIDTH * done) / total, LOADING_BAR_HEIGHT, ST77XX_GREEN);
+  }
+}
+
+bool isLoading() {
+  NetLock lock;
+  return loadState == LOAD_LOADING;
+}
+
+// Draw the loading bar while the task preloads, and tidy up when it's done.
+void updateLoadProgress() {
+  static bool wasLoading = false;
+  static int barDrawn = -1;
+
+  bool loading;
+  int done, total;
+  {
+    NetLock lock;
+    loading = loadState == LOAD_LOADING;
+    done = loadDone;
+    total = loadTotal;
+  }
+
+  if (loading) {
+    if (done != barDrawn) {
+      drawLoadingBar(done, total);
+      barDrawn = done;
+    }
+    wasLoading = true;
+  } else if (wasLoading) {
+    wasLoading = false;
+    barDrawn = -1;
+    display.fillRect(0, 0, SCREEN_WIDTH, LOADING_BAR_HEIGHT, ST77XX_BLACK);
+    resetPlayback();
+  }
+}
+
+void applyNetwork() {
+  NetMessageTaken message;
+  bool gotMessage;
+  {
+    NetLock lock;
+    gotMessage = netTakeMessage(messageBox, message);
+  }
+
+  if (gotMessage) {
+    if (message.hasText) {
+      currentText = message.text;
+    }
+    serverOnline = message.online;
+
+    // Does nothing while a GIF or effect is on screen, or if nothing changed.
+    drawTextScreen();
+  }
+
+  // While the task preloads it owns the cache and the program; take new
+  // programs once it hands them back.
+  NetAnimTaken update;
+  bool gotUpdate;
+  {
+    NetLock lock;
+    gotUpdate = loadState == LOAD_READY && netTakeAnim(animBox, update, timeline);
+  }
+
+  if (!gotUpdate) {
     return;
   }
 
-  if (needPreload) {
-    needPreload = false;
-    preloadFrames();
-    checkAnimation(true);
+  if (update.programChanged) {
+    animationVersion = update.version;
+    freeFrameCache();
+    resetPlayback();
+    clock_.synced = false;
+
+    if (tlActive(timeline)) {
+      // Leave the old picture up while the new program loads; the new
+      // program's first draw replaces it. Forget what was shown so that draw
+      // can't be skipped as "already on screen".
+      freeCanvas();
+      screenMode = SCREEN_TEXT;
+      shownClip = -1;
+      shownFrame = -1;
+      shownEffect = TL_EFFECT_NONE;
+      shownStep = -1;
+      shownStyle = TL_STYLE_NONE;
+      textDirty = true;
+
+      if (timeline.frameCount > 0) {
+        NetLock lock;
+        loadDone = 0;
+        loadTotal = timeline.frameCount;
+        loadState = LOAD_LOADING;
+      }
+    } else {
+      // Nothing to play: clear the old content and show the message.
+      enterTextMode();
+    }
+  } else if (update.version != animationVersion) {
+    return;  // sync for a program we haven't taken
+  }
+
+  if (update.hasSync && tlActive(timeline)) {
+    if (tlSync(timeline, clock_, update.refMs, update.positionMs, update.forceSync)) {
+      resetPlayback();
+    }
   }
 }
 
@@ -1502,53 +1672,6 @@ void playTimeline() {
 
 // ---- Server polling and setup ------------------------------------------------
 
-void pollServer() {
-  if (WiFi.status() != WL_CONNECTED) {
-    serverOnline = false;
-    drawTextScreen();
-    return;
-  }
-
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + SERVER_IP +
-               ":5050/api/message?device=" + DEVICE_NAME +
-               "&screen=st7735";
-
-  http.setTimeout(5000);
-
-  if (!http.begin(client, url)) {
-    serverOnline = false;
-    drawTextScreen();
-    return;
-  }
-
-  int code = http.GET();
-
-  if (code == HTTP_CODE_OK) {
-    String response = http.getString();
-    JSONVar doc = JSON.parse(response);
-
-    if (JSON.typeof(doc) != "undefined") {
-      currentText = (const char *)doc["text"];
-      serverOnline = true;
-    } else {
-      Serial.println("Message poll: invalid JSON");
-      serverOnline = false;
-    }
-  } else {
-    Serial.printf("Message poll: HTTP %d\n", code);
-    serverOnline = false;
-  }
-
-  http.end();
-
-  // drawTextScreen() clears the display before showing the current message.
-  // It does nothing while a GIF or effect is on screen.
-  drawTextScreen();
-}
-
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -1580,23 +1703,19 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   currentText = "Waiting for server";
-
-  refreshAnimation();
   drawTextScreen();
 
-  lastPoll = millis();
+  // From here on the network task does all the HTTP. It runs on core 0 (with
+  // the WiFi stack); loop() stays on core 1 and only draws.
+  netMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTask, "net", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
-  unsigned long now = millis();
+  updateLoadProgress();
+  applyNetwork();
 
-  if (now - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = now;
-    pollServer();
-    refreshAnimation();
-  }
-
-  if (tlActive(timeline)) {
+  if (tlActive(timeline) && !isLoading()) {
     playTimeline();
   }
 

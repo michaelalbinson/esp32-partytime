@@ -4,11 +4,13 @@ set -e
 cd "$(dirname "$0")/.."
 
 for sketch in esp-ssd1306 esp-7219max; do
-  if ! cmp -s esp-st7735/timeline.h "$sketch/timeline.h"; then
-    echo "$sketch/timeline.h differs from esp-st7735/timeline.h; copy it over:"
-    echo "  cp sketch/esp-st7735/timeline.h sketch/$sketch/timeline.h"
-    exit 1
-  fi
+  for header in timeline.h netlink.h; do
+    if ! cmp -s "esp-st7735/$header" "$sketch/$header"; then
+      echo "$sketch/$header differs from esp-st7735/$header; copy it over:"
+      echo "  cp sketch/esp-st7735/$header sketch/$sketch/$header"
+      exit 1
+    fi
+  done
 done
 
 out="$(mktemp -d)/test_timeline"
