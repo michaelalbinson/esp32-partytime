@@ -136,11 +136,13 @@ bool checkAnimation() {
   size_t newPixelCount = (size_t)newWidth * (size_t)newHeight;
 
   // Validate the variable-sized frame against the pixel budget and display.
-  if (newWidth < 1 || newHeight < 1 ||
-      newPixelCount > MAX_FRAME_PIXELS ||
-      newX < 0 || newY < 0 ||
-      newX + newWidth > SCREEN_WIDTH ||
-      newY + newHeight > SCREEN_HEIGHT) {
+  // A cleared animation (no frames) reports a 0x0 size, which is valid.
+  if (newFrameCount > 0 &&
+      (newWidth < 1 || newHeight < 1 ||
+       newPixelCount > MAX_FRAME_PIXELS ||
+       newX < 0 || newY < 0 ||
+       newX + newWidth > SCREEN_WIDTH ||
+       newY + newHeight > SCREEN_HEIGHT)) {
     Serial.printf("Invalid frame geometry: %dx%d at %d,%d\n",
                   newWidth, newHeight, newX, newY);
     return false;
@@ -162,10 +164,13 @@ bool checkAnimation() {
                   newVersion, newFrameCount, newWidth, newHeight);
   }
 
-  frameWidth = newWidth;
-  frameHeight = newHeight;
-  frameX = newX;
-  frameY = newY;
+  if (newFrameCount > 0) {
+    frameWidth = newWidth;
+    frameHeight = newHeight;
+    frameX = newX;
+    frameY = newY;
+  }
+
   animationFrameCount = newFrameCount;
   animationActive = animationFrameCount > 0;
 
