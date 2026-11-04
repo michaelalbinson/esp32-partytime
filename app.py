@@ -210,6 +210,19 @@ def update_message():
             "text": text,
             "version": message_version,
         }
+
+        # A new message replaces any playing animation. Bumping the version
+        # tells devices the animation changed, so they stop and show the text.
+        anim = devices[device_id].get("animation", {})
+        if anim.get("frames") or anim.get("rgb332_frames"):
+            devices[device_id]["animation"] = {
+                "version": int(anim.get("version", 0)) + 1,
+                "frames": [],
+                "color_frames": [],
+                "jpeg_frames": [],
+                "rgb332_frames": [],
+            }
+
         save_devices()
         return jsonify(devices[device_id]["message"])
 

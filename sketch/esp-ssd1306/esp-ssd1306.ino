@@ -65,6 +65,9 @@ bool checkAnimation() {
     animationFrameCount = newFrameCount;
     animationFrameIndex = 0;
     Serial.printf("Animation updated to version %d with %d frames\n", newVersion, newFrameCount);
+
+    // Animation was cleared (e.g. a new message was sent): show the text again.
+    if (newFrameCount == 0) drawScreen();
   }
 
   return true;
